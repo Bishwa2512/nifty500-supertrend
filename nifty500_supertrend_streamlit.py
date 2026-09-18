@@ -1,8 +1,5 @@
-import os
-import io
 import gzip
 import json
-import sqlite3
 import time
 from datetime import datetime, timedelta
 
@@ -10,21 +7,27 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-import plotly.graph_objects as go
 
 # ============================================================
 # NIFTY 500 WEEKLY HEIKIN ASHI + SUPERTREND (7,3) SCANNER
 # Single-file Streamlit application
 #
 # Requirements:
-#   pip install streamlit pandas numpy requests plotly
+#   streamlit
+#   pandas
+#   numpy
+#   requests
 #
-# Token is hard-coded below for testing only.
+# No CSV dependency at runtime.
+# No SQLite database.
+# No chart / Plotly.
+# Watchlist is persisted in GitHub.
 # ============================================================
 
 APP_TITLE = "NIFTY 500 Weekly Supertrend Scanner"
-NIFTY500_FILE = "ind_nifty500list.csv"
-DATABASE_FILE = "scanner.db"
+WATCHLIST_FILE = "watchlist.json"
+GITHUB_REPO = "Bishwa2512/nifty500-supertrend"
+GITHUB_BRANCH = "main"
 
 ATR_PERIOD = 7
 SUPERTREND_MULTIPLIER = 3
@@ -50,9 +53,8 @@ st.caption(
     "4-hour scanner • Friday manual check"
 )
 
-
 # ============================================================
-# AUTHENTICATION
+# UPSTOX AUTHENTICATION
 # ============================================================
 
 # TESTING ONLY: Upstox access token hard-coded in ONE place.
@@ -64,61 +66,199 @@ HEADERS = {
 }
 
 
-# DATABASE
+# ============================================================
+# GITHUB WATCHLIST PERSISTENCE
 # ============================================================
 
-@st.cache_resource
-def get_connection():
-    return sqlite3.connect(
-        DATABASE_FILE,
-        check_same_thread=False
+# TESTING ONLY:
+# Paste your GitHub fine-grained PAT here.
+# Required repository permission: Contents = Read and write.
+GITHUB_TOKEN = "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"
+
+
+def github_headers():
+    if not GITHUB_TOKEN or GITHUB_TOKEN == "PASTE_YOUR_GITHUB_PAT_HERE":
+        return None
+
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN.strip()}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def github_file_url():
+    return (
+        f"https://api.github.com/repos/{GITHUB_REPO}/contents/"
+        f"{WATCHLIST_FILE}?ref={GITHUB_BRANCH}"
     )
 
-conn = get_connection()
+
+@st.cache_data(ttl=30)
+def load_watchlist():
+    headers = github_headers()
+
+    if not headers:
+        return []
+
+    response = requests.get(
+        github_file_url(),
+        headers=headers,
+        timeout=20
+    )
+
+    if response.status_code == 404:
+        return []
+
+    response.raise_for_status()
+
+    payload = response.json()
+    content = payload.get("content", "")
+
+    if not content:
+        return []
+
+    import base64
+
+    raw = base64.b64decode(
+        content.replace("\n", "")
+    ).decode("utf-8")
+
+    data = json.loads(raw)
+
+    return data if isinstance(data, list) else []
 
 
-def initialize_database():
-    cur = conn.cursor()
+def save_watchlist(watchlist):
+    headers = github_headers()
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS watchlist (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL,
-            company TEXT,
-            instrument_key TEXT,
-            signal_week TEXT,
-            signal_date TEXT,
-            previous_direction TEXT,
-            current_direction TEXT,
-            ha_close REAL,
-            supertrend REAL,
-            status TEXT DEFAULT 'ACTIVE',
-            created_at TEXT,
-            closed_at TEXT,
-            UNIQUE(symbol, signal_week)
+    if not headers:
+        raise RuntimeError(
+            "GITHUB_TOKEN is not configured in the Python file."
         )
-    """)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS scanner_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_time TEXT,
-            total_stocks INTEGER,
-            successful INTEGER,
-            failed INTEGER,
-            new_signals INTEGER
-        )
-    """)
+    import base64
 
-    conn.commit()
+    response = requests.get(
+        github_file_url(),
+        headers=headers,
+        timeout=20
+    )
+
+    sha = (
+        response.json().get("sha")
+        if response.status_code == 200
+        else None
+    )
+
+    if response.status_code not in (200, 404):
+        response.raise_for_status()
+
+    raw = json.dumps(
+        watchlist,
+        indent=2,
+        ensure_ascii=False
+    )
+
+    payload = {
+        "message": "Update scanner watchlist",
+        "content": base64.b64encode(
+            raw.encode("utf-8")
+        ).decode("ascii"),
+        "branch": GITHUB_BRANCH,
+    }
+
+    if sha:
+        payload["sha"] = sha
+
+    write_response = requests.put(
+        github_file_url(),
+        headers=headers,
+        json=payload,
+        timeout=20
+    )
+
+    write_response.raise_for_status()
+
+    load_watchlist.clear()
 
 
-initialize_database()
+def add_signal_to_watchlist(result):
+    if not result["Confirmed Signal"]:
+        return False
+
+    watchlist = load_watchlist()
+
+    for item in watchlist:
+        if (
+            item.get("symbol") == result["Symbol"]
+            and item.get("signal_week") == result["Signal Week"]
+        ):
+            return False
+
+    now = datetime.now().isoformat()
+
+    watchlist.append({
+        "symbol": result["Symbol"],
+        "company": result["Company"],
+        "instrument_key": result["Instrument Key"],
+        "signal_week": result["Signal Week"],
+        "signal_date": datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ),
+        "previous_direction": result["Previous ST"],
+        "current_direction": result["Completed ST"],
+        "ha_close": result["HA Close"],
+        "supertrend": result["Supertrend"],
+        "status": "ACTIVE",
+        "created_at": now,
+        "closed_at": None,
+    })
+
+    save_watchlist(watchlist)
+
+    return True
 
 
-# ============================================================
-# NIFTY 500
-# ============================================================
+def update_watchlist_status(results):
+    watchlist = load_watchlist()
+    changed = False
+
+    for result in results:
+        if result["Completed ST"] != "RED":
+            continue
+
+        for item in watchlist:
+            if (
+                item.get("symbol") == result["Symbol"]
+                and item.get("status") == "ACTIVE"
+            ):
+                item["status"] = "INACTIVE"
+                item["closed_at"] = datetime.now().isoformat()
+                changed = True
+
+    if changed:
+        save_watchlist(watchlist)
+
+
+def clear_active_watchlist():
+    watchlist = load_watchlist()
+    changed = False
+
+    for item in watchlist:
+        if item.get("status") == "ACTIVE":
+            item["status"] = "INACTIVE"
+            item["closed_at"] = datetime.now().isoformat()
+            changed = True
+
+    if changed:
+        save_watchlist(watchlist)
+
+
+# Backward-compatible name used by the scanner.
+def save_signal(result):
+    return add_signal_to_watchlist(result)
+
 
 # ============================================================
 # HARD-CODED NIFTY 500 SYMBOLS
@@ -661,89 +801,6 @@ def process_stock(
 
 
 # ============================================================
-# SAVE SIGNAL
-# ============================================================
-
-def save_signal(result):
-
-    if not result["Confirmed Signal"]:
-        return False
-
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        INSERT OR IGNORE INTO watchlist
-        (
-            symbol,
-            company,
-            instrument_key,
-            signal_week,
-            signal_date,
-            previous_direction,
-            current_direction,
-            ha_close,
-            supertrend,
-            status,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)
-        """,
-        (
-            result["Symbol"],
-            result["Company"],
-            result["Instrument Key"],
-            result["Signal Week"],
-            datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-            result["Previous ST"],
-            result["Completed ST"],
-            result["HA Close"],
-            result["Supertrend"],
-            datetime.now().isoformat()
-        )
-    )
-
-    conn.commit()
-
-    return cur.rowcount > 0
-
-
-# ============================================================
-# WATCHLIST STATUS
-# ============================================================
-
-def update_watchlist_status(results):
-
-    cur = conn.cursor()
-
-    for result in results:
-
-        # Close an active watchlist entry only when the
-        # COMPLETED weekly candle is RED.
-        if result["Completed ST"] == "RED":
-
-            cur.execute(
-                """
-                UPDATE watchlist
-                SET
-                    status='INACTIVE',
-                    closed_at=?
-                WHERE
-                    symbol=?
-                    AND status='ACTIVE'
-                """,
-                (
-                    datetime.now().isoformat(),
-                    result["Symbol"]
-                )
-            )
-
-    conn.commit()
-
-
-# ============================================================
 # FULL SCAN
 # ============================================================
 
@@ -827,30 +884,14 @@ def run_full_scan():
         results
     )
 
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        INSERT INTO scanner_runs
-        (
-            run_time,
-            total_stocks,
-            successful,
-            failed,
-            new_signals
-        )
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            datetime.now().isoformat(),
-            total,
-            len(results),
-            len(failures),
-            new_signals
-        )
-    )
-
-    conn.commit()
+    st.session_state["last_scan_time"] = datetime.now()
+    st.session_state["last_scan_info"] = {
+        "run_time": datetime.now().isoformat(timespec="seconds"),
+        "total": total,
+        "successful": len(results),
+        "failed": len(failures),
+        "new_signals": new_signals,
+    }
 
     status_box.success(
         f"Scan complete — "
@@ -867,35 +908,14 @@ def run_full_scan():
 # ============================================================
 
 def should_scan():
+    last_scan = st.session_state.get("last_scan_time")
 
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT run_time
-        FROM scanner_runs
-        ORDER BY id DESC
-        LIMIT 1
-        """
-    )
-
-    row = cur.fetchone()
-
-    if not row:
-        return True
-
-    try:
-        last_run = datetime.fromisoformat(
-            row[0]
-        )
-    except Exception:
+    if last_scan is None:
         return True
 
     return (
-        datetime.now() - last_run
-    ) >= timedelta(
-        hours=REFRESH_HOURS
-    )
+        datetime.now() - last_scan
+    ) >= timedelta(hours=REFRESH_HOURS)
 
 
 # ============================================================
@@ -935,25 +955,9 @@ if st.sidebar.button(
     "🧹 CLEAR ACTIVE WATCHLIST",
     use_container_width=True
 ):
+    clear_active_watchlist()
 
-    conn.execute(
-        """
-        UPDATE watchlist
-        SET
-            status='INACTIVE',
-            closed_at=?
-        WHERE status='ACTIVE'
-        """,
-        (
-            datetime.now().isoformat(),
-        )
-    )
-
-    conn.commit()
-
-    st.success(
-        "Active watchlist cleared."
-    )
+    st.success("Active watchlist cleared.")
 
     st.rerun()
 
@@ -982,23 +986,22 @@ else:
 # LOAD WATCHLIST
 # ============================================================
 
-watchlist_df = pd.read_sql_query(
-    """
-    SELECT
-        symbol AS Symbol,
-        company AS Company,
-        signal_date AS "Signal Date",
-        signal_week AS "Signal Week",
-        ha_close AS "HA Close",
-        previous_direction AS "Previous ST",
-        current_direction AS "Signal ST",
-        supertrend AS Supertrend,
-        status AS Status
-    FROM watchlist
-    ORDER BY signal_date DESC
-    """,
-    conn
-)
+watchlist_records = load_watchlist()
+
+watchlist_df = pd.DataFrame([
+    {
+        "Symbol": x.get("symbol", ""),
+        "Company": x.get("company", ""),
+        "Signal Date": x.get("signal_date", ""),
+        "Signal Week": x.get("signal_week", ""),
+        "HA Close": x.get("ha_close"),
+        "Previous ST": x.get("previous_direction", ""),
+        "Signal ST": x.get("current_direction", ""),
+        "Supertrend": x.get("supertrend"),
+        "Status": x.get("status", "ACTIVE"),
+    }
+    for x in watchlist_records
+])
 
 
 # ============================================================
@@ -1063,7 +1066,6 @@ else:
     tab_live,
     tab_watchlist,
     tab_all,
-    tab_chart,
     tab_status
 ) = st.tabs(
     [
@@ -1071,7 +1073,6 @@ else:
         "🟡 LIVE / FRIDAY",
         "👀 WATCHLIST",
         "📊 NIFTY 500",
-        "📈 CHART",
         "⚙️ STATUS"
     ]
 )
@@ -1287,114 +1288,6 @@ with tab_all:
 
 
 # ============================================================
-# CHART
-# ============================================================
-
-with tab_chart:
-
-    st.subheader(
-        "📈 Weekly Heikin Ashi + Supertrend"
-    )
-
-    if not scan_results:
-
-        st.info(
-            "Run the scanner first."
-        )
-
-    else:
-
-        symbols = sorted(
-            [
-                x["Symbol"]
-                for x in scan_results
-            ]
-        )
-
-        selected = st.selectbox(
-            "Select Stock",
-            symbols
-        )
-
-        result = next(
-            (
-                x
-                for x in scan_results
-                if x["Symbol"] == selected
-            ),
-            None
-        )
-
-        if result:
-
-            data = result["Data"].tail(
-                40
-            ).copy()
-
-            fig = go.Figure()
-
-            # Heikin Ashi candles
-            fig.add_trace(
-                go.Candlestick(
-                    x=data["timestamp"],
-                    open=data["ha_open"],
-                    high=data["ha_high"],
-                    low=data["ha_low"],
-                    close=data["ha_close"],
-                    name="Heikin Ashi"
-                )
-            )
-
-            # Supertrend
-            fig.add_trace(
-                go.Scatter(
-                    x=data["timestamp"],
-                    y=data["supertrend"],
-                    mode="lines",
-                    name="Supertrend (7,3)"
-                )
-            )
-
-            fig.update_layout(
-                title=(
-                    f"{selected} — Weekly "
-                    "Heikin Ashi + Supertrend (7,3)"
-                ),
-                xaxis_title="Week",
-                yaxis_title="Price",
-                height=650,
-                xaxis_rangeslider_visible=False
-            )
-
-            st.plotly_chart(
-                fig,
-                use_container_width=True
-            )
-
-            c1, c2, c3, c4 = st.columns(4)
-
-            c1.metric(
-                "Previous ST",
-                result["Previous ST"]
-            )
-
-            c2.metric(
-                "Completed ST",
-                result["Completed ST"]
-            )
-
-            c3.metric(
-                "Live ST",
-                result["Live ST"]
-            )
-
-            c4.metric(
-                "Live Price",
-                f"₹{result['Live Price']:,.2f}"
-            )
-
-
-# ============================================================
 # STATUS
 # ============================================================
 
@@ -1427,63 +1320,24 @@ with tab_status:
         "4 Hours"
     )
 
-    cur = conn.cursor()
+    info = st.session_state.get("last_scan_info")
 
-    cur.execute(
-        """
-        SELECT
-            run_time,
-            total_stocks,
-            successful,
-            failed,
-            new_signals
-        FROM scanner_runs
-        ORDER BY id DESC
-        LIMIT 1
-        """
-    )
-
-    last_run = cur.fetchone()
-
-    if last_run:
-
-        run_time = last_run[0]
-        total = last_run[1]
-        successful = last_run[2]
-        failed = last_run[3]
-        new_signals = last_run[4]
-
-        st.write(
-            f"**Last scan:** {run_time}"
-        )
+    if info:
+        st.write(f"**Last scan:** {info["run_time"]}")
 
         c1, c2, c3, c4 = st.columns(4)
 
-        c1.metric(
-            "Scanned",
-            total
-        )
-
-        c2.metric(
-            "Successful",
-            successful
-        )
-
-        c3.metric(
-            "Failed",
-            failed
-        )
-
-        c4.metric(
-            "New Signals",
-            new_signals
-        )
-
+        c1.metric("Scanned", info["total"])
+        c2.metric("Successful", info["successful"])
+        c3.metric("Failed", info["failed"])
+        c4.metric("New Signals", info["new_signals"])
     else:
+        st.warning("No scan has been completed in this app session.")
 
-        st.warning(
-            "No scan has been completed yet."
-        )
+    st.info(
+        f"Watchlist storage: GitHub `{GITHUB_REPO}` → `{WATCHLIST_FILE}` "
+        f"(branch `{GITHUB_BRANCH}`)"
+    )
 
     if scan_failures:
 
@@ -1542,28 +1396,15 @@ with tab_status:
 # LAST UPDATE / AUTO PAGE REFRESH
 # ============================================================
 
-cur = conn.cursor()
+info = st.session_state.get("last_scan_info")
 
-cur.execute(
-    """
-    SELECT run_time
-    FROM scanner_runs
-    ORDER BY id DESC
-    LIMIT 1
-    """
-)
-
-last = cur.fetchone()
-
-if last:
+if info:
     st.caption(
-        f"Last scanner run: {last[0]} | "
+        f"Last scanner run: {info['run_time']} | "
         f"Automatic interval: {REFRESH_HOURS} hours"
     )
 
 # Browser refresh every 4 hours.
-# This ensures the Streamlit page itself comes back and
-# triggers the should_scan() check.
 st.markdown(
     f"""
 <script>
@@ -1574,6 +1415,7 @@ setTimeout(function() {{
 """,
     unsafe_allow_html=True
 )
+
 
 st.caption(
     "For personal use. Market data and signals should be independently verified."
