@@ -94,39 +94,113 @@ def github_file_url():
     )
 
 
+def github_error_message(response):
+    try:
+        data = response.json()
+        message = data.get("message", "")
+    except Exception:
+        message = ""
+
+    if response.status_code == 401:
+        return (
+            "GitHub authentication failed (401). "
+            "Check that GITHUB_TOKEN is valid and not expired/revoked."
+        )
+
+    if response.status_code == 403:
+        return (
+            "GitHub access denied (403). "
+            "Your PAT needs repository Contents = Read and write permission "
+            "for Bishwa2512/nifty500-supertrend."
+        )
+
+    if response.status_code == 404:
+        return (
+            "GitHub returned 404. For a private repository this usually means "
+            "the PAT cannot access the repository, or the repository/path/branch "
+            "is incorrect."
+        )
+
+    if response.status_code == 409:
+        return (
+            "GitHub returned 409 Conflict. The repository/branch may be empty "
+            "or unavailable."
+        )
+
+    return (
+        f"GitHub HTTP {response.status_code}"
+        + (f": {message}" if message else "")
+    )
+
+
+def set_github_error(message):
+    st.session_state["github_error"] = message
+
+
+def clear_github_error():
+    st.session_state.pop("github_error", None)
+
+
 @st.cache_data(ttl=30)
 def load_watchlist():
     headers = github_headers()
 
     if not headers:
-        return []
+        set_github_error(
+            "GitHub PAT is not configured. "
+            "Paste your PAT into GITHUB_TOKEN in the Python file."
+        )
+        return st.session_state.get("watchlist_fallback", [])
 
-    response = requests.get(
-        github_file_url(),
-        headers=headers,
-        timeout=20
-    )
+    try:
+        response = requests.get(
+            github_file_url(),
+            headers=headers,
+            timeout=20
+        )
+    except requests.RequestException as exc:
+        set_github_error(f"GitHub connection failed: {exc}")
+        return st.session_state.get("watchlist_fallback", [])
 
     if response.status_code == 404:
+        # watchlist.json does not exist yet. This is normal on first run.
+        clear_github_error()
+        st.session_state["watchlist_fallback"] = []
         return []
 
-    response.raise_for_status()
+    if response.status_code != 200:
+        set_github_error(github_error_message(response))
+        return st.session_state.get("watchlist_fallback", [])
 
-    payload = response.json()
-    content = payload.get("content", "")
+    try:
+        payload = response.json()
+        content = payload.get("content", "")
 
-    if not content:
-        return []
+        if not content:
+            clear_github_error()
+            st.session_state["watchlist_fallback"] = []
+            return []
 
-    import base64
+        import base64
 
-    raw = base64.b64decode(
-        content.replace("\n", "")
-    ).decode("utf-8")
+        raw = base64.b64decode(
+            content.replace("\n", "")
+        ).decode("utf-8")
 
-    data = json.loads(raw)
+        data = json.loads(raw)
 
-    return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            raise ValueError("watchlist.json must contain a JSON list.")
+
+        clear_github_error()
+        st.session_state["watchlist_fallback"] = data
+        return data
+
+    except Exception as exc:
+        set_github_error(
+            f"GitHub watchlist could not be decoded: {exc}"
+        )
+        return st.session_state.get("watchlist_fallback", [])
 
 
 def save_watchlist(watchlist):
@@ -134,25 +208,29 @@ def save_watchlist(watchlist):
 
     if not headers:
         raise RuntimeError(
-            "GITHUB_TOKEN is not configured in the Python file."
+            "GitHub PAT is not configured. "
+            "Paste your PAT into GITHUB_TOKEN in the Python file."
         )
 
     import base64
 
-    response = requests.get(
-        github_file_url(),
-        headers=headers,
-        timeout=20
-    )
+    try:
+        response = requests.get(
+            github_file_url(),
+            headers=headers,
+            timeout=20
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"GitHub connection failed while reading watchlist.json: {exc}"
+        )
 
-    sha = (
-        response.json().get("sha")
-        if response.status_code == 200
-        else None
-    )
-
-    if response.status_code not in (200, 404):
-        response.raise_for_status()
+    if response.status_code == 200:
+        sha = response.json().get("sha")
+    elif response.status_code == 404:
+        sha = None
+    else:
+        raise RuntimeError(github_error_message(response))
 
     raw = json.dumps(
         watchlist,
@@ -171,15 +249,23 @@ def save_watchlist(watchlist):
     if sha:
         payload["sha"] = sha
 
-    write_response = requests.put(
-        github_file_url(),
-        headers=headers,
-        json=payload,
-        timeout=20
-    )
+    try:
+        write_response = requests.put(
+            github_file_url(),
+            headers=headers,
+            json=payload,
+            timeout=20
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"GitHub connection failed while saving watchlist.json: {exc}"
+        )
 
-    write_response.raise_for_status()
+    if write_response.status_code not in (200, 201):
+        raise RuntimeError(github_error_message(write_response))
 
+    st.session_state["watchlist_fallback"] = watchlist
+    clear_github_error()
     load_watchlist.clear()
 
 
@@ -215,9 +301,14 @@ def add_signal_to_watchlist(result):
         "closed_at": None,
     })
 
-    save_watchlist(watchlist)
-
-    return True
+    try:
+        save_watchlist(watchlist)
+        return True
+    except RuntimeError as exc:
+        set_github_error(str(exc))
+        # Keep the signal in this session so the scan itself can complete.
+        st.session_state["watchlist_fallback"] = watchlist
+        return False
 
 
 def update_watchlist_status(results):
@@ -238,7 +329,11 @@ def update_watchlist_status(results):
                 changed = True
 
     if changed:
-        save_watchlist(watchlist)
+        try:
+            save_watchlist(watchlist)
+        except RuntimeError as exc:
+            set_github_error(str(exc))
+            st.session_state["watchlist_fallback"] = watchlist
 
 
 def clear_active_watchlist():
@@ -252,10 +347,13 @@ def clear_active_watchlist():
             changed = True
 
     if changed:
-        save_watchlist(watchlist)
+        try:
+            save_watchlist(watchlist)
+        except RuntimeError as exc:
+            set_github_error(str(exc))
+            st.session_state["watchlist_fallback"] = watchlist
 
 
-# Backward-compatible name used by the scanner.
 def save_signal(result):
     return add_signal_to_watchlist(result)
 
@@ -952,6 +1050,45 @@ manual_scan = st.sidebar.button(
 )
 
 if st.sidebar.button(
+    "🔐 TEST GITHUB CONNECTION",
+    use_container_width=True
+):
+    headers = github_headers()
+
+    if not headers:
+        set_github_error(
+            "GITHUB_TOKEN is not configured."
+        )
+    else:
+        try:
+            test_response = requests.get(
+                github_file_url(),
+                headers=headers,
+                timeout=20
+            )
+
+            if test_response.status_code in (200, 404):
+                clear_github_error()
+                st.sidebar.success(
+                    "GitHub connection OK."
+                )
+            else:
+                set_github_error(
+                    github_error_message(test_response)
+                )
+                st.sidebar.error(
+                    github_error_message(test_response)
+                )
+
+        except requests.RequestException as exc:
+            set_github_error(
+                f"GitHub connection failed: {exc}"
+            )
+            st.sidebar.error(
+                f"GitHub connection failed: {exc}"
+            )
+
+if st.sidebar.button(
     "🧹 CLEAR ACTIVE WATCHLIST",
     use_container_width=True
 ):
@@ -961,6 +1098,16 @@ if st.sidebar.button(
 
     st.rerun()
 
+
+# ============================================================
+# GITHUB STATUS
+# ============================================================
+
+if st.session_state.get("github_error"):
+    st.warning(
+        "⚠️ GitHub watchlist: "
+        + st.session_state["github_error"]
+    )
 
 # ============================================================
 # RUN SCANNER
