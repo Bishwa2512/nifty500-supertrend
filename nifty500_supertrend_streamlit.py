@@ -23,13 +23,13 @@ import plotly.graph_objects as go
 #
 # Set your NEW Upstox token as:
 #   Linux/VPS:
-#       export UPSTOX_ACCESS_TOKEN="eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI4NUJGRkEiLCJqdGkiOiI2YTk0NzBhMDA0OTg2ZjU4NmI1MWIxZWQiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc4ODExMzA1NiwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE5NjYzMjAwfQ.R8W20uaGUSNWGtmLSXu_xcvNGSxWQJZgMcutKWqy4r4"
+#       export UPSTOX_ACCESS_TOKEN="YOUR_NEW_TOKEN"
 #
 #   Windows PowerShell:
-#       $env:UPSTOX_ACCESS_TOKEN="eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI4NUJGRkEiLCJqdGkiOiI2YTk0NzBhMDA0OTg2ZjU4NmI1MWIxZWQiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc4ODExMzA1NiwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE5NjYzMjAwfQ.R8W20uaGUSNWGtmLSXu_xcvNGSxWQJZgMcutKWqy4r4"
+#       $env:UPSTOX_ACCESS_TOKEN="YOUR_NEW_TOKEN"
 #
 #   Streamlit Cloud secrets:
-#       UPSTOX_ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI4NUJGRkEiLCJqdGkiOiI2YTk0NzBhMDA0OTg2ZjU4NmI1MWIxZWQiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc4ODExMzA1NiwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE5NjYzMjAwfQ.R8W20uaGUSNWGtmLSXu_xcvNGSxWQJZgMcutKWqy4r4"
+#       UPSTOX_ACCESS_TOKEN = "YOUR_NEW_TOKEN"
 #
 # Never hard-code your token in this file.
 # ============================================================
