@@ -19,19 +19,7 @@ import plotly.graph_objects as go
 # Requirements:
 #   pip install streamlit pandas numpy requests plotly
 #
-# Put ind_nifty500list.csv in the same folder as this file.
-#
-# Set your NEW Upstox token as:
-#   Linux/VPS:
-#       export UPSTOX_ACCESS_TOKEN="YOUR_NEW_TOKEN"
-#
-#   Windows PowerShell:
-#       $env:UPSTOX_ACCESS_TOKEN="YOUR_NEW_TOKEN"
-#
-#   Streamlit Cloud secrets:
-#       UPSTOX_ACCESS_TOKEN = "YOUR_NEW_TOKEN"
-#
-# Never hard-code your token in this file.
+# Token is hard-coded below for testing only.
 # ============================================================
 
 APP_TITLE = "NIFTY 500 Weekly Supertrend Scanner"
@@ -67,49 +55,8 @@ st.caption(
 # AUTHENTICATION
 # ============================================================
 
-def get_token():
-    token = os.environ.get("UPSTOX_ACCESS_TOKEN")
-    if token:
-        return token.strip()
-
-    try:
-        token = st.secrets["UPSTOX_ACCESS_TOKEN"]
-        if token:
-            return str(token).strip()
-    except Exception:
-        pass
-
-    return None
-
-
-TOKEN = get_token()
-
-if not TOKEN:
-    st.error("UPSTOX_ACCESS_TOKEN is not configured.")
-    st.markdown("""
-### Configure the token
-
-**Linux / VPS**
-```bash
-export UPSTOX_ACCESS_TOKEN="YOUR_NEW_TOKEN"
-```
-
-**Windows PowerShell**
-```powershell
-$env:UPSTOX_ACCESS_TOKEN="YOUR_NEW_TOKEN"
-```
-
-**Streamlit Cloud**
-
-Add this under App → Settings → Secrets:
-
-```toml
-UPSTOX_ACCESS_TOKEN = "YOUR_NEW_TOKEN"
-```
-
-Do not put the token in the CSV or this Python file.
-""")
-    st.stop()
+# TESTING ONLY: Upstox access token hard-coded in ONE place.
+TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI4NUJGRkEiLCJqdGkiOiI2YTk0NzBhMDA0OTg2ZjU4NmI1MWIxZWQiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc4ODExMzA1NiwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE5NjYzMjAwfQ.R8W20uaGUSNWGtmLSXu_xcvNGSxWQJZgMcutKWqy4r4"
 
 HEADERS = {
     "Accept": "application/json",
@@ -117,7 +64,6 @@ HEADERS = {
 }
 
 
-# ============================================================
 # DATABASE
 # ============================================================
 
