@@ -21,13 +21,10 @@ import streamlit as st
 # No CSV dependency at runtime.
 # No SQLite database.
 # No chart / Plotly.
-# Watchlist is persisted in GitHub.
+# Watchlist is persisted locally on the Lightsail VPS.
 # ============================================================
 
 APP_TITLE = "NIFTY 500 Weekly Supertrend Scanner"
-WATCHLIST_FILE = "watchlist.json"
-GITHUB_REPO = "Bishwa2512/nifty500-supertrend"
-GITHUB_BRANCH = "main"
 
 ATR_PERIOD = 7
 SUPERTREND_MULTIPLIER = 3
@@ -67,206 +64,51 @@ HEADERS = {
 
 
 # ============================================================
-# GITHUB WATCHLIST PERSISTENCE
+# LOCAL WATCHLIST PERSISTENCE (LIGHTSAIL VPS)
 # ============================================================
 
-# TESTING ONLY:
-# Paste your GitHub fine-grained PAT here.
-# Required repository permission: Contents = Read and write.
-GITHUB_TOKEN = "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"
+# Code lives in GitHub; watchlist data stays on the VPS.
+# This file is intentionally local and should NOT be committed to GitHub.
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+WATCHLIST_FILE = BASE_DIR / "watchlist.json"
 
 
-def github_headers():
-    if not GITHUB_TOKEN or GITHUB_TOKEN == "PASTE_YOUR_GITHUB_PAT_HERE":
-        return None
-
-    return {
-        "Authorization": f"Bearer {GITHUB_TOKEN.strip()}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-
-def github_file_url():
-    return (
-        f"https://api.github.com/repos/{GITHUB_REPO}/contents/"
-        f"{WATCHLIST_FILE}?ref={GITHUB_BRANCH}"
-    )
-
-
-def github_error_message(response):
-    try:
-        data = response.json()
-        message = data.get("message", "")
-    except Exception:
-        message = ""
-
-    if response.status_code == 401:
-        return (
-            "GitHub authentication failed (401). "
-            "Check that GITHUB_TOKEN is valid and not expired/revoked."
-        )
-
-    if response.status_code == 403:
-        return (
-            "GitHub access denied (403). "
-            "Your PAT needs repository Contents = Read and write permission "
-            "for Bishwa2512/nifty500-supertrend."
-        )
-
-    if response.status_code == 404:
-        return (
-            "GitHub returned 404. For a private repository this usually means "
-            "the PAT cannot access the repository, or the repository/path/branch "
-            "is incorrect."
-        )
-
-    if response.status_code == 409:
-        return (
-            "GitHub returned 409 Conflict. The repository/branch may be empty "
-            "or unavailable."
-        )
-
-    return (
-        f"GitHub HTTP {response.status_code}"
-        + (f": {message}" if message else "")
-    )
-
-
-def set_github_error(message):
-    st.session_state["github_error"] = message
-
-
-def clear_github_error():
-    st.session_state.pop("github_error", None)
-
-
-@st.cache_data(ttl=30)
 def load_watchlist():
-    headers = github_headers()
-
-    if not headers:
-        set_github_error(
-            "GitHub PAT is not configured. "
-            "Paste your PAT into GITHUB_TOKEN in the Python file."
-        )
-        return st.session_state.get("watchlist_fallback", [])
-
+    """Load the persistent watchlist from the local VPS disk."""
     try:
-        response = requests.get(
-            github_file_url(),
-            headers=headers,
-            timeout=20
-        )
-    except requests.RequestException as exc:
-        set_github_error(f"GitHub connection failed: {exc}")
-        return st.session_state.get("watchlist_fallback", [])
-
-    if response.status_code == 404:
-        # watchlist.json does not exist yet. This is normal on first run.
-        clear_github_error()
-        st.session_state["watchlist_fallback"] = []
-        return []
-
-    if response.status_code != 200:
-        set_github_error(github_error_message(response))
-        return st.session_state.get("watchlist_fallback", [])
-
-    try:
-        payload = response.json()
-        content = payload.get("content", "")
-
-        if not content:
-            clear_github_error()
-            st.session_state["watchlist_fallback"] = []
+        if not WATCHLIST_FILE.exists():
             return []
 
-        import base64
-
-        raw = base64.b64decode(
-            content.replace("\n", "")
-        ).decode("utf-8")
+        raw = WATCHLIST_FILE.read_text(encoding="utf-8")
+        if not raw.strip():
+            return []
 
         data = json.loads(raw)
-
         if not isinstance(data, list):
             raise ValueError("watchlist.json must contain a JSON list.")
 
-        clear_github_error()
-        st.session_state["watchlist_fallback"] = data
         return data
 
     except Exception as exc:
-        set_github_error(
-            f"GitHub watchlist could not be decoded: {exc}"
-        )
-        return st.session_state.get("watchlist_fallback", [])
+        st.warning(f"⚠️ Local watchlist could not be loaded: {exc}")
+        return []
 
 
 def save_watchlist(watchlist):
-    headers = github_headers()
-
-    if not headers:
-        raise RuntimeError(
-            "GitHub PAT is not configured. "
-            "Paste your PAT into GITHUB_TOKEN in the Python file."
-        )
-
-    import base64
+    """Atomically save the watchlist to the VPS disk."""
+    temp_file = WATCHLIST_FILE.with_suffix(".json.tmp")
+    raw = json.dumps(watchlist, indent=2, ensure_ascii=False)
 
     try:
-        response = requests.get(
-            github_file_url(),
-            headers=headers,
-            timeout=20
-        )
-    except requests.RequestException as exc:
+        WATCHLIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp_file.write_text(raw, encoding="utf-8")
+        temp_file.replace(WATCHLIST_FILE)
+    except Exception as exc:
         raise RuntimeError(
-            f"GitHub connection failed while reading watchlist.json: {exc}"
+            f"Could not save local watchlist at {WATCHLIST_FILE}: {exc}"
         )
-
-    if response.status_code == 200:
-        sha = response.json().get("sha")
-    elif response.status_code == 404:
-        sha = None
-    else:
-        raise RuntimeError(github_error_message(response))
-
-    raw = json.dumps(
-        watchlist,
-        indent=2,
-        ensure_ascii=False
-    )
-
-    payload = {
-        "message": "Update scanner watchlist",
-        "content": base64.b64encode(
-            raw.encode("utf-8")
-        ).decode("ascii"),
-        "branch": GITHUB_BRANCH,
-    }
-
-    if sha:
-        payload["sha"] = sha
-
-    try:
-        write_response = requests.put(
-            github_file_url(),
-            headers=headers,
-            json=payload,
-            timeout=20
-        )
-    except requests.RequestException as exc:
-        raise RuntimeError(
-            f"GitHub connection failed while saving watchlist.json: {exc}"
-        )
-
-    if write_response.status_code not in (200, 201):
-        raise RuntimeError(github_error_message(write_response))
-
-    st.session_state["watchlist_fallback"] = watchlist
-    clear_github_error()
-    load_watchlist.clear()
 
 
 def add_signal_to_watchlist(result):
@@ -305,9 +147,7 @@ def add_signal_to_watchlist(result):
         save_watchlist(watchlist)
         return True
     except RuntimeError as exc:
-        set_github_error(str(exc))
-        # Keep the signal in this session so the scan itself can complete.
-        st.session_state["watchlist_fallback"] = watchlist
+        st.error(str(exc))
         return False
 
 
@@ -332,8 +172,7 @@ def update_watchlist_status(results):
         try:
             save_watchlist(watchlist)
         except RuntimeError as exc:
-            set_github_error(str(exc))
-            st.session_state["watchlist_fallback"] = watchlist
+            st.error(str(exc))
 
 
 def clear_active_watchlist():
@@ -350,8 +189,7 @@ def clear_active_watchlist():
         try:
             save_watchlist(watchlist)
         except RuntimeError as exc:
-            set_github_error(str(exc))
-            st.session_state["watchlist_fallback"] = watchlist
+            st.error(str(exc))
 
 
 def save_signal(result):
@@ -1046,51 +884,12 @@ st.sidebar.write(
 
 manual_scan = st.sidebar.button(
     "🔄 RUN SCANNER NOW",
-    use_container_width=True
+    width="stretch"
 )
 
 if st.sidebar.button(
-    "🔐 TEST GITHUB CONNECTION",
-    use_container_width=True
-):
-    headers = github_headers()
-
-    if not headers:
-        set_github_error(
-            "GITHUB_TOKEN is not configured."
-        )
-    else:
-        try:
-            test_response = requests.get(
-                github_file_url(),
-                headers=headers,
-                timeout=20
-            )
-
-            if test_response.status_code in (200, 404):
-                clear_github_error()
-                st.sidebar.success(
-                    "GitHub connection OK."
-                )
-            else:
-                set_github_error(
-                    github_error_message(test_response)
-                )
-                st.sidebar.error(
-                    github_error_message(test_response)
-                )
-
-        except requests.RequestException as exc:
-            set_github_error(
-                f"GitHub connection failed: {exc}"
-            )
-            st.sidebar.error(
-                f"GitHub connection failed: {exc}"
-            )
-
-if st.sidebar.button(
     "🧹 CLEAR ACTIVE WATCHLIST",
-    use_container_width=True
+    width="stretch"
 ):
     clear_active_watchlist()
 
@@ -1100,14 +899,12 @@ if st.sidebar.button(
 
 
 # ============================================================
-# GITHUB STATUS
+# LOCAL WATCHLIST STATUS
 # ============================================================
 
-if st.session_state.get("github_error"):
-    st.warning(
-        "⚠️ GitHub watchlist: "
-        + st.session_state["github_error"]
-    )
+st.sidebar.caption(
+    f"Watchlist: local VPS → {WATCHLIST_FILE.name}"
+)
 
 # ============================================================
 # RUN SCANNER
@@ -1135,20 +932,35 @@ else:
 
 watchlist_records = load_watchlist()
 
-watchlist_df = pd.DataFrame([
-    {
-        "Symbol": x.get("symbol", ""),
-        "Company": x.get("company", ""),
-        "Signal Date": x.get("signal_date", ""),
-        "Signal Week": x.get("signal_week", ""),
-        "HA Close": x.get("ha_close"),
-        "Previous ST": x.get("previous_direction", ""),
-        "Signal ST": x.get("current_direction", ""),
-        "Supertrend": x.get("supertrend"),
-        "Status": x.get("status", "ACTIVE"),
-    }
-    for x in watchlist_records
-])
+WATCHLIST_COLUMNS = [
+    "Symbol",
+    "Company",
+    "Signal Date",
+    "Signal Week",
+    "HA Close",
+    "Previous ST",
+    "Signal ST",
+    "Supertrend",
+    "Status",
+]
+
+watchlist_df = pd.DataFrame(
+    [
+        {
+            "Symbol": x.get("symbol", ""),
+            "Company": x.get("company", ""),
+            "Signal Date": x.get("signal_date", ""),
+            "Signal Week": x.get("signal_week", ""),
+            "HA Close": x.get("ha_close"),
+            "Previous ST": x.get("previous_direction", ""),
+            "Signal ST": x.get("current_direction", ""),
+            "Supertrend": x.get("supertrend"),
+            "Status": x.get("status", "ACTIVE"),
+        }
+        for x in watchlist_records
+    ],
+    columns=WATCHLIST_COLUMNS,
+)
 
 
 # ============================================================
@@ -1267,7 +1079,7 @@ with tab_confirmed:
 
             st.dataframe(
                 confirmed,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -1315,7 +1127,7 @@ with tab_live:
 
             st.dataframe(
                 pending,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -1331,7 +1143,7 @@ with tab_watchlist:
     )
 
     active = watchlist_df[
-        watchlist_df["Status"]
+        watchlist_df["Status"].fillna("")
         == "ACTIVE"
     ].copy()
 
@@ -1357,7 +1169,7 @@ with tab_watchlist:
 
         st.dataframe(
             active,
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
@@ -1377,7 +1189,7 @@ with tab_watchlist:
 
         st.dataframe(
             watchlist_df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
@@ -1429,7 +1241,7 @@ with tab_all:
 
         st.dataframe(
             filtered,
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
@@ -1482,8 +1294,7 @@ with tab_status:
         st.warning("No scan has been completed in this app session.")
 
     st.info(
-        f"Watchlist storage: GitHub `{GITHUB_REPO}` → `{WATCHLIST_FILE}` "
-        f"(branch `{GITHUB_BRANCH}`)"
+        f"Watchlist storage: local Lightsail VPS → `{WATCHLIST_FILE}`"
     )
 
     if scan_failures:
@@ -1496,7 +1307,7 @@ with tab_status:
 
         st.dataframe(
             pd.DataFrame(scan_failures),
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
