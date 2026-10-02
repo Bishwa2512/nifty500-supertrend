@@ -1,1380 +1,1168 @@
-import gzip
-import json
-import time
-from datetime import datetime, timedelta
-
-import numpy as np
-import pandas as pd
-import requests
 import streamlit as st
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import plotly.graph_objects as go
+from datetime import datetime
 
 # ============================================================
-# NIFTY 500 WEEKLY HEIKIN ASHI + SUPERTREND (7,3) SCANNER
-# Single-file Streamlit application
-#
-# Requirements:
-#   streamlit
-#   pandas
-#   numpy
-#   requests
-#
-# No CSV dependency at runtime.
-# No SQLite database.
-# No chart / Plotly.
-# Watchlist is persisted locally on the Lightsail VPS.
+# CONFIG
 # ============================================================
-
-APP_TITLE = "NIFTY 500 Weekly Supertrend Scanner"
-
-ATR_PERIOD = 7
-SUPERTREND_MULTIPLIER = 3
-HISTORY_WEEKS = 60
-REFRESH_HOURS = 4
-
-UPSTOX_HISTORY_URL = "https://api.upstox.com/v3/historical-candle"
-UPSTOX_LTP_URL = "https://api.upstox.com/v2/market-quote/ltp"
-UPSTOX_INSTRUMENT_URL = (
-    "https://assets.upstox.com/market-quote/"
-    "instruments/exchange/complete.json.gz"
-)
 
 st.set_page_config(
-    page_title=APP_TITLE,
+    page_title="Hilega-Milega ETF Scanner",
     page_icon="📊",
     layout="wide"
 )
 
-st.title("📊 NIFTY 500 Weekly Heikin Ashi Supertrend")
-st.caption(
-    "Weekly • Heikin Ashi • Supertrend (7,3) • Upstox • "
-    "4-hour scanner • Friday manual check"
-)
-
 # ============================================================
-# UPSTOX AUTHENTICATION
+# ETF LIST
 # ============================================================
 
-# TESTING ONLY: Upstox access token hard-coded in ONE place.
-TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI4NUJGRkEiLCJqdGkiOiI2YTk0NzBhMDA0OTg2ZjU4NmI1MWIxZWQiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc4ODExMzA1NiwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE5NjYzMjAwfQ.R8W20uaGUSNWGtmLSXu_xcvNGSxWQJZgMcutKWqy4r4"
+ETF_LIST = [
+    "CPSEETF",
+    "SETFGOLD",
+    "GOLDBEES",
+    "TATAGOLD",
+    "HNGSNGBEES",
+    "MAHKTECH",
+    "MONQ50",
+    "MON100",
+    "NIF100IETF",
+    "LOWVOLIETF",
+    "MOM30IETF",
+    "MOMOMENTUM",
+    "NIFTYQLITY",
+    "NIFTYIETF",
+    "SETFNIF50",
+    "NIFTYBEES",
+    "SBINEQWETF",
+    "ALPHA",
+    "ALPL30IETF",
+    "AUTOBEES",
+    "BANKBEES",
+    "SETFNIFBK",
+    "BANKIETF",
+    "DIVOPPBEES",
+    "BFSI",
+    "FMCGIETF",
+    "HEALTHIETF",
+    "HEALTHY",
+    "CONSUMIETF",
+    "CONSUMBEES",
+    "TNIDETF",
+    "MAKEINDIA",
+    "IT",
+    "ITIETF",
+    "ITBEES",
+    "MOM100",
+    "MIDCAPIETF",
+    "MID150BEES",
+    "HDFCMID150",
+    "MIDCAPETF",
+    "UTINEXT50",
+    "NEXT50IETF",
+    "JUNIORBEES",
+    "PHARMABEES",
+    "PVTBANIETF",
+    "PSUBANKADD",
+    "PSUBNKBEES",
+    "PSUBNKIETF",
+    "HDFCSML250",
+    "ESG",
+    "NV20BEES",
+    "NV20IETF",
+    "MAFANG",
+    "MASPTOP50",
+    "BSE500IETF",
+    "MIDSELIETF",
+    "SILVERIETF",
+    "SILVERBEES",
+    "HDFCSILVER",
+]
 
-HEADERS = {
-    "Accept": "application/json",
-    "Authorization": f"Bearer {TOKEN}",
-}
-
-
-# ============================================================
-# LOCAL WATCHLIST PERSISTENCE (LIGHTSAIL VPS)
-# ============================================================
-
-# Code lives in GitHub; watchlist data stays on the VPS.
-# This file is intentionally local and should NOT be committed to GitHub.
-from pathlib import Path
-
-BASE_DIR = Path(__file__).resolve().parent
-WATCHLIST_FILE = BASE_DIR / "watchlist.json"
-
-
-def load_watchlist():
-    """Load the persistent watchlist from the local VPS disk."""
-    try:
-        if not WATCHLIST_FILE.exists():
-            return []
-
-        raw = WATCHLIST_FILE.read_text(encoding="utf-8")
-        if not raw.strip():
-            return []
-
-        data = json.loads(raw)
-        if not isinstance(data, list):
-            raise ValueError("watchlist.json must contain a JSON list.")
-
-        return data
-
-    except Exception as exc:
-        st.warning(f"⚠️ Local watchlist could not be loaded: {exc}")
-        return []
-
-
-def save_watchlist(watchlist):
-    """Atomically save the watchlist to the VPS disk."""
-    temp_file = WATCHLIST_FILE.with_suffix(".json.tmp")
-    raw = json.dumps(watchlist, indent=2, ensure_ascii=False)
-
-    try:
-        WATCHLIST_FILE.parent.mkdir(parents=True, exist_ok=True)
-        temp_file.write_text(raw, encoding="utf-8")
-        temp_file.replace(WATCHLIST_FILE)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Could not save local watchlist at {WATCHLIST_FILE}: {exc}"
-        )
-
-
-def add_signal_to_watchlist(result):
-    if not result["Confirmed Signal"]:
-        return False
-
-    watchlist = load_watchlist()
-
-    for item in watchlist:
-        if (
-            item.get("symbol") == result["Symbol"]
-            and item.get("signal_week") == result["Signal Week"]
-        ):
-            return False
-
-    now = datetime.now().isoformat()
-
-    watchlist.append({
-        "symbol": result["Symbol"],
-        "company": result["Company"],
-        "instrument_key": result["Instrument Key"],
-        "signal_week": result["Signal Week"],
-        "signal_date": datetime.now().strftime(
-            "%Y-%m-%d %H:%M:%S"
-        ),
-        "previous_direction": result["Previous ST"],
-        "current_direction": result["Completed ST"],
-        "ha_close": result["HA Close"],
-        "supertrend": result["Supertrend"],
-        "status": "ACTIVE",
-        "created_at": now,
-        "closed_at": None,
-    })
-
-    try:
-        save_watchlist(watchlist)
-        return True
-    except RuntimeError as exc:
-        st.error(str(exc))
-        return False
-
-
-def update_watchlist_status(results):
-    watchlist = load_watchlist()
-    changed = False
-
-    for result in results:
-        if result["Completed ST"] != "RED":
-            continue
-
-        for item in watchlist:
-            if (
-                item.get("symbol") == result["Symbol"]
-                and item.get("status") == "ACTIVE"
-            ):
-                item["status"] = "INACTIVE"
-                item["closed_at"] = datetime.now().isoformat()
-                changed = True
-
-    if changed:
-        try:
-            save_watchlist(watchlist)
-        except RuntimeError as exc:
-            st.error(str(exc))
-
-
-def clear_active_watchlist():
-    watchlist = load_watchlist()
-    changed = False
-
-    for item in watchlist:
-        if item.get("status") == "ACTIVE":
-            item["status"] = "INACTIVE"
-            item["closed_at"] = datetime.now().isoformat()
-            changed = True
-
-    if changed:
-        try:
-            save_watchlist(watchlist)
-        except RuntimeError as exc:
-            st.error(str(exc))
-
-
-def save_signal(result):
-    return add_signal_to_watchlist(result)
-
+TICKERS = [f"{symbol}.NS" for symbol in ETF_LIST]
 
 # ============================================================
-# HARD-CODED NIFTY 500 SYMBOLS
+# HILEGA-MILEGA SETTINGS
 # ============================================================
 
-NIFTY500_SYMBOLS = ['360ONE', '3MINDIA', 'ABB', 'ACC', 'ACMESOLAR', 'AIAENG', 'APLAPOLLO', 'AUBANK', 'AWL', 'AADHARHFC', 'AARTIIND', 'AAVAS', 'ABBOTINDIA', 'ACE', 'ACUTAAS', 'ADANIENSOL', 'ADANIENT', 'ADANIGREEN', 'ADANIPORTS', 'ADANIPOWER', 'ATGL', 'ABCAPITAL', 'ABFRL', 'ABLBL', 'ABREL', 'ABSLAMC', 'CPPLUS', 'AEGISLOG', 'AEGISVOPAK', 'AFCONS', 'AFFLE', 'AJANTPHARM', 'ALKEM', 'ABDL', 'ARE&M', 'AMBER', 'AMBUJACEM', 'ANANDRATHI', 'ANANTRAJ', 'ANGELONE', 'ANTHEM', 'ANURAS', 'APARINDS', 'APOLLOHOSP', 'APOLLOTYRE', 'APTUS', 'ASAHIINDIA', 'ASHOKLEY', 'ASIANPAINT', 'ASTERDM', 'ASTRAL', 'ATHERENERG', 'ATUL', 'AUROPHARMA', 'AIIL', 'DMART', 'AXISBANK', 'BEML', 'BLS', 'BSE', 'BAJAJ-AUTO', 'BAJFINANCE', 'BAJAJFINSV', 'BAJAJHLDNG', 'BAJAJHFL', 'BALKRISIND', 'BALRAMCHIN', 'BANDHANBNK', 'BANKBARODA', 'BANKINDIA', 'MAHABANK', 'BATAINDIA', 'BAYERCROP', 'BELRISE', 'BERGEPAINT', 'BDL', 'BEL', 'BHARATFORG', 'BHEL', 'BPCL', 'BHARTIARTL', 'BHARTIHEXA', 'BIKAJI', 'GROWW', 'BIOCON', 'BSOFT', 'BLUEDART', 'BLUEJET', 'BLUESTARCO', 'BBTC', 'BOSCHLTD', 'FIRSTCRY', 'BRIGADE', 'BRITANNIA', 'MAPMYINDIA', 'CCL', 'CESC', 'CGPOWER', 'CIEINDIA', 'CRISIL', 'CANFINHOME', 'CANBK', 'CANHLIFE', 'CAPLIPOINT', 'CGCL', 'CARBORUNIV', 'CARTRADE', 'CASTROLIND', 'CEATLTD', 'CEMPRO', 'CENTRALBK', 'CDSL', 'CHALET', 'CHAMBLFERT', 'CHENNPETRO', 'CHOICEIN', 'CHOLAHLDNG', 'CHOLAFIN', 'CIPLA', 'CUB', 'CLEAN', 'COALINDIA', 'COCHINSHIP', 'COFORGE', 'COHANCE', 'COLPAL', 'CAMS', 'CONCORDBIO', 'CONCOR', 'COROMANDEL', 'CRAFTSMAN', 'CREDITACC', 'CROMPTON', 'CUMMINSIND', 'CYIENT', 'DCMSHRIRAM', 'DLF', 'DOMS', 'DABUR', 'DALBHARAT', 'DATAPATTNS', 'DEEPAKFERT', 'DEEPAKNTR', 'DELHIVERY', 'DEVYANI', 'DIVISLAB', 'DIXON', 'LALPATHLAB', 'DRREDDY', 'DUMMYHEG', 'EIDPARRY', 'EIHOTEL', 'EICHERMOT', 'ELECON', 'ELGIEQUIP', 'EMAMILTD', 'EMCURE', 'EMMVEE', 'ENDURANCE', 'ENGINERSIN', 'ERIS', 'ESCORTS', 'ETERNAL', 'EXIDEIND', 'NYKAA', 'FEDERALBNK', 'FACT', 'FINCABLES', 'FSL', 'FIVESTAR', 'FORCEMOT', 'FORTIS', 'GAIL', 'GVT&D', 'GMRAIRPORT', 'GABRIEL', 'GALLANTT', 'GRSE', 'GICRE', 'GILLETTE', 'GLAND', 'GLAXO', 'GLENMARK', 'MEDANTA', 'GODIGIT', 'GPIL', 'GODFRYPHLP', 'GODREJCP', 'GODREJIND', 'GODREJPROP', 'GRANULES', 'GRAPHITE', 'GRASIM', 'GRAVITA', 'GESHIP', 'FLUOROCHEM', 'GMDCLTD', 'HBLENGINE', 'HCLTECH', 'HDBFS', 'HDFCAMC', 'HDFCBANK', 'HDFCLIFE', 'HEG', 'HFCL', 'HAVELLS', 'HEROMOTOCO', 'HEXT', 'HSCL', 'HINDALCO', 'HAL', 'HINDCOPPER', 'HINDPETRO', 'HINDUNILVR', 'HINDZINC', 'POWERINDIA', 'HOMEFIRST', 'HONASA', 'HONAUT', 'HUDCO', 'HYUNDAI', 'ICICIBANK', 'ICICIGI', 'ICICIAMC', 'ICICIPRULI', 'IDBI', 'IDFCFIRSTB', 'IFCI', 'IIFL', 'IRB', 'IRCON', 'ITCHOTELS', 'ITC', 'ITI', 'INDGN', 'INDIACEM', 'INDIAMART', 'INDIANB', 'IEX', 'INDHOTEL', 'IOC', 'IOB', 'IRCTC', 'IRFC', 'IREDA', 'IGL', 'INDUSTOWER', 'INDUSINDBK', 'NAUKRI', 'INFY', 'INOXWIND', 'INTELLECT', 'INDIGO', 'IGIL', 'IKS', 'IPCALAB', 'JKCEMENT', 'JBMA', 'JKTYRE', 'JMFINANCIL', 'JSWCEMENT', 'JSWDULUX', 'JSWENERGY', 'JSWINFRA', 'JSWSTEEL', 'JAINREC', 'JPPOWER', 'J&KBANK', 'JINDALSAW', 'JSL', 'JINDALSTEL', 'JIOFIN', 'JUBLFOOD', 'JUBLINGREA', 'JUBLPHARMA', 'JWL', 'JYOTICNC', 'KPRMILL', 'KEI', 'KPITTECH', 'KAJARIACER', 'KPIL', 'KALYANKJIL', 'KARURVYSYA', 'KAYNES', 'KEC', 'KFINTECH', 'KIRLOSENG', 'KOTAKBANK', 'KIMS', 'LTF', 'LTTS', 'LGEINDIA', 'LICHSGFIN', 'LTFOODS', 'LTM', 'LT', 'LATENTVIEW', 'LAURUSLABS', 'THELEELA', 'LEMONTREE', 'LENSKART', 'LICI', 'LINDEINDIA', 'LLOYDSME', 'LODHA', 'LUPIN', 'MMTC', 'MRF', 'MGL', 'M&MFIN', 'M&M', 'MANAPPURAM', 'MRPL', 'MANKIND', 'MARICO', 'MARUTI', 'MFSL', 'MAXHEALTH', 'MAZDOCK', 'MEESHO', 'MINDACORP', 'MSUMI', 'MOTILALOFS', 'MPHASIS', 'MCX', 'MUTHOOTFIN', 'NATCOPHARM', 'NBCC', 'NCC', 'NHPC', 'NLCINDIA', 'NMDC', 'NSLNISP', 'NTPCGREEN', 'NTPC', 'NH', 'NATIONALUM', 'NAVA', 'NAVINFLUOR', 'NESTLEIND', 'NETWEB', 'NEULANDLAB', 'NEWGEN', 'NAM-INDIA', 'NIVABUPA', 'NUVAMA', 'NUVOCO', 'OBEROIRLTY', 'ONGC', 'OIL', 'OLAELEC', 'OLECTRA', 'PAYTM', 'ONESOURCE', 'OFSS', 'POLICYBZR', 'PCBL', 'PGEL', 'PIIND', 'PNBHOUSING', 'PTCIL', 'PVRINOX', 'PAGEIND', 'PARADEEP', 'PATANJALI', 'PERSISTENT', 'PETRONET', 'PFIZER', 'PHOENIXLTD', 'PWL', 'PIDILITIND', 'PINELABS', 'PIRAMALFIN', 'PPLPHARMA', 'POLYMED', 'POLYCAB', 'POONAWALLA', 'PFC', 'POWERGRID', 'PREMIERENE', 'PRESTIGE', 'PFOCUS', 'PNB', 'RRKABEL', 'RBLBANK', 'RECLTD', 'RHIM', 'RITES', 'RADICO', 'RVNL', 'RAILTEL', 'RAINBOW', 'RKFORGE', 'REDINGTON', 'RELIANCE', 'RPOWER', 'SBFC', 'SBICARD', 'SBILIFE', 'SJVN', 'SRF', 'SAGILITY', 'SAILIFE', 'SAMMAANCAP', 'MOTHERSON', 'SAPPHIRE', 'SARDAEN', 'SAREGAMA', 'SCHAEFFLER', 'SCHNEIDER', 'SCI', 'SHREECEM', 'SHRIRAMFIN', 'SHYAMMETL', 'ENRIN', 'SIEMENS', 'SIGNATURE', 'SOBHA', 'SOLARINDS', 'SONACOMS', 'SONATSOFTW', 'STARHEALTH', 'SBIN', 'SAIL', 'SUMICHEM', 'SUNPHARMA', 'SUNTV', 'SUNDARMFIN', 'SUPREMEIND', 'SPLPETRO', 'SUZLON', 'SWANCORP', 'SWIGGY', 'SYNGENE', 'SYRMA', 'TBOTEK', 'TVSMOTOR', 'TATACAP', 'TATACHEM', 'TATACOMM', 'TCS', 'TATACONSUM', 'TATAELXSI', 'TATAINVEST', 'TMCV', 'TMPV', 'TATAPOWER', 'TATASTEEL', 'TATATECH', 'TTML', 'TECHM', 'TECHNOE', 'TEGA', 'TEJASNET', 'TENNIND', 'NIACL', 'RAMCOCEM', 'THERMAX', 'TIMKEN', 'TITAGARH', 'TITAN', 'TORNTPHARM', 'TORNTPOWER', 'TARIL', 'TRAVELFOOD', 'TRENT', 'TRIDENT', 'TRITURBINE', 'TIINDIA', 'UCOBANK', 'UNOMINDA', 'UPL', 'UTIAMC', 'ULTRACEMCO', 'UNIONBANK', 'UBL', 'UNITDSPR', 'URBANCO', 'USHAMART', 'VTL', 'VBL', 'VEDL', 'VIJAYA', 'VMM', 'IDEA', 'VOLTAS', 'WAAREEENER', 'WELCORP', 'WELSPUNLIV', 'WHIRLPOOL', 'WIPRO', 'WOCKPHARMA', 'YESBANK', 'ZFCVINDIA', 'ZEEL', 'ZENTEC', 'ZENSARTECH', 'ZYDUSLIFE', 'ZYDUSWELL', 'ECLERX']
+RSI_LENGTH = 9
+EMA_LENGTH = 3
+WMA_LENGTH = 21
 
-
-def load_nifty500():
-    # NIFTY 500 symbols are hard-coded below.
-    # No NIFTY 500 CSV is required at runtime.
-    return pd.DataFrame({
-        "Symbol": NIFTY500_SYMBOLS,
-        "Company Name": NIFTY500_SYMBOLS
-    })
-
+OVERBOUGHT = 60
+OVERSOLD = 40
 
 # ============================================================
-# UPSTOX INSTRUMENT MASTER
+# INDICATOR FUNCTIONS
 # ============================================================
 
-@st.cache_data(ttl=86400)
-def load_upstox_instruments():
-    response = requests.get(
-        UPSTOX_INSTRUMENT_URL,
-        timeout=90
-    )
-    response.raise_for_status()
+def calculate_rsi(series, length=9):
+    """
+    TradingView ta.rsi() style Wilder RSI.
+    """
 
-    raw = gzip.decompress(response.content)
-    data = json.loads(raw.decode("utf-8"))
+    delta = series.diff()
 
-    rows = []
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-    for item in data:
-        if item.get("segment") != "NSE_EQ":
-            continue
-
-        if item.get("instrument_type") != "EQ":
-            continue
-
-        symbol = item.get("trading_symbol")
-        instrument_key = item.get("instrument_key")
-
-        if not symbol or not instrument_key:
-            continue
-
-        rows.append({
-            "Symbol": str(symbol).upper(),
-            "instrument_key": instrument_key,
-            "Upstox Name": item.get("name", "")
-        })
-
-    result = pd.DataFrame(rows)
-
-    if result.empty:
-        raise RuntimeError(
-            "Upstox instrument master returned no NSE_EQ instruments."
-        )
-
-    return result.drop_duplicates(
-        subset=["Symbol"]
-    )
-
-
-@st.cache_data(ttl=86400)
-def build_universe():
-    nifty = load_nifty500()
-    instruments = load_upstox_instruments()
-
-    universe = nifty.merge(
-        instruments,
-        on="Symbol",
-        how="left"
-    )
-
-    return universe
-
-
-# ============================================================
-# UPSTOX WEEKLY DATA
-# ============================================================
-
-def get_weekly_candles(instrument_key):
-    today = datetime.now().date()
-
-    from_date = (
-        today -
-        timedelta(days=HISTORY_WEEKS * 8)
-    )
-
-    encoded_key = requests.utils.quote(
-        str(instrument_key),
-        safe=""
-    )
-
-    url = (
-        f"{UPSTOX_HISTORY_URL}/"
-        f"{encoded_key}/weeks/1/"
-        f"{today.isoformat()}/"
-        f"{from_date.isoformat()}"
-    )
-
-    response = requests.get(
-        url,
-        headers=HEADERS,
-        timeout=30
-    )
-
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"HTTP {response.status_code}: "
-            f"{response.text[:500]}"
-        )
-
-    payload = response.json()
-
-    candles = (
-        payload
-        .get("data", {})
-        .get("candles", [])
-    )
-
-    if not candles:
-        raise RuntimeError(
-            "No weekly candles returned."
-        )
-
-    rows = []
-
-    for candle in candles:
-        if len(candle) < 5:
-            continue
-
-        rows.append({
-            "timestamp": candle[0],
-            "open": float(candle[1]),
-            "high": float(candle[2]),
-            "low": float(candle[3]),
-            "close": float(candle[4]),
-            "volume": (
-                float(candle[5])
-                if len(candle) > 5
-                else 0
-            )
-        })
-
-    df = pd.DataFrame(rows)
-
-    if df.empty:
-        raise RuntimeError(
-            "No usable weekly candles."
-        )
-
-    df["timestamp"] = pd.to_datetime(
-        df["timestamp"]
-    )
-
-    df = (
-        df.sort_values("timestamp")
-        .drop_duplicates("timestamp")
-        .reset_index(drop=True)
-    )
-
-    return df
-
-
-# ============================================================
-# HEIKIN ASHI
-# ============================================================
-
-def calculate_heikin_ashi(df):
-    df = df.copy()
-
-    df["ha_close"] = (
-        df["open"]
-        + df["high"]
-        + df["low"]
-        + df["close"]
-    ) / 4.0
-
-    ha_open = []
-
-    for i in range(len(df)):
-        if i == 0:
-            value = (
-                df.loc[i, "open"]
-                + df.loc[i, "close"]
-            ) / 2.0
-        else:
-            value = (
-                ha_open[i - 1]
-                + df.loc[i - 1, "ha_close"]
-            ) / 2.0
-
-        ha_open.append(value)
-
-    df["ha_open"] = ha_open
-
-    df["ha_high"] = df[
-        ["high", "ha_open", "ha_close"]
-    ].max(axis=1)
-
-    df["ha_low"] = df[
-        ["low", "ha_open", "ha_close"]
-    ].min(axis=1)
-
-    return df
-
-
-# ============================================================
-# ATR
-# ============================================================
-
-def calculate_atr(df, period=7):
-    high = df["ha_high"]
-    low = df["ha_low"]
-    previous_close = df["ha_close"].shift(1)
-
-    tr1 = high - low
-    tr2 = (high - previous_close).abs()
-    tr3 = (low - previous_close).abs()
-
-    true_range = pd.concat(
-        [tr1, tr2, tr3],
-        axis=1
-    ).max(axis=1)
-
-    # Wilder-style ATR
-    atr = true_range.ewm(
-        alpha=1 / period,
+    avg_gain = gain.ewm(
+        alpha=1 / length,
         adjust=False,
-        min_periods=period
+        min_periods=length
     ).mean()
 
-    return atr
+    avg_loss = loss.ewm(
+        alpha=1 / length,
+        adjust=False,
+        min_periods=length
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+
+    rsi = 100 - (100 / (1 + rs))
+
+    return rsi
 
 
-# ============================================================
-# SUPERTREND
-# ============================================================
+def calculate_wma(series, length=21):
+    """
+    TradingView ta.wma() equivalent.
+    """
 
-def calculate_supertrend(
-    df,
-    period=7,
-    multiplier=3
-):
+    weights = np.arange(1, length + 1)
+    weight_sum = weights.sum()
+
+    return series.rolling(length).apply(
+        lambda x: np.dot(x, weights) / weight_sum,
+        raw=True
+    )
+
+
+def calculate_hilega_milega(df):
+    """
+    Hilega-Milega:
+
+    RSI = RSI(9)
+    EMA = EMA(RSI, 3)
+    WMA = WMA(RSI, 21)
+
+    BUY:
+        RSI > WMA
+        AND
+        EMA > WMA
+
+    EXIT:
+        RSI <= WMA
+        OR
+        EMA <= WMA
+
+    Signals are generated only when the condition changes.
+    """
+
     df = df.copy()
 
-    df["atr"] = calculate_atr(
-        df,
-        period
+    df["RSI"] = calculate_rsi(
+        df["Close"],
+        RSI_LENGTH
     )
 
-    hl2 = (
-        df["ha_high"]
-        + df["ha_low"]
-    ) / 2.0
+    df["EMA"] = df["RSI"].ewm(
+        span=EMA_LENGTH,
+        adjust=False
+    ).mean()
 
-    df["basic_upper"] = (
-        hl2
-        + multiplier * df["atr"]
+    df["WMA"] = calculate_wma(
+        df["RSI"],
+        WMA_LENGTH
     )
 
-    df["basic_lower"] = (
-        hl2
-        - multiplier * df["atr"]
+    # ========================================================
+    # MAIN CONDITION
+    # ========================================================
+
+    df["Bullish"] = (
+        (df["RSI"] > df["WMA"]) &
+        (df["EMA"] > df["WMA"])
     )
 
-    n = len(df)
-
-    final_upper = np.full(
-        n,
-        np.nan
+    previous_bullish = (
+        df["Bullish"]
+        .shift(1)
+        .fillna(False)
+        .astype(bool)
     )
 
-    final_lower = np.full(
-        n,
-        np.nan
+    # ========================================================
+    # BUY ONLY WHEN CONDITION CHANGES FALSE -> TRUE
+    # ========================================================
+
+    df["BUY"] = (
+        df["Bullish"] &
+        ~previous_bullish
     )
 
-    supertrend = np.full(
-        n,
-        np.nan
-    )
+    # ========================================================
+    # EXIT ONLY WHEN CONDITION CHANGES TRUE -> FALSE
+    # ========================================================
 
-    direction = [
-        None
-    ] * n
-
-    for i in range(n):
-
-        if pd.isna(
-            df["atr"].iloc[i]
-        ):
-            continue
-
-        if i == 0:
-            final_upper[i] = (
-                df["basic_upper"].iloc[i]
-            )
-            final_lower[i] = (
-                df["basic_lower"].iloc[i]
-            )
-            continue
-
-        if pd.isna(
-            final_upper[i - 1]
-        ):
-            final_upper[i] = (
-                df["basic_upper"].iloc[i]
-            )
-            final_lower[i] = (
-                df["basic_lower"].iloc[i]
-            )
-            continue
-
-        previous_close = (
-            df["ha_close"].iloc[i - 1]
-        )
-
-        basic_upper = (
-            df["basic_upper"].iloc[i]
-        )
-
-        basic_lower = (
-            df["basic_lower"].iloc[i]
-        )
-
-        if (
-            basic_upper < final_upper[i - 1]
-            or previous_close > final_upper[i - 1]
-        ):
-            final_upper[i] = basic_upper
-        else:
-            final_upper[i] = final_upper[i - 1]
-
-        if (
-            basic_lower > final_lower[i - 1]
-            or previous_close < final_lower[i - 1]
-        ):
-            final_lower[i] = basic_lower
-        else:
-            final_lower[i] = final_lower[i - 1]
-
-        if i == 1 or pd.isna(
-            supertrend[i - 1]
-        ):
-            supertrend[i] = final_lower[i]
-            direction[i] = "GREEN"
-            continue
-
-        previous_st = supertrend[i - 1]
-
-        if previous_st == final_upper[i - 1]:
-
-            if (
-                df["ha_close"].iloc[i]
-                <= final_upper[i]
-            ):
-                supertrend[i] = final_upper[i]
-            else:
-                supertrend[i] = final_lower[i]
-
-        else:
-
-            if (
-                df["ha_close"].iloc[i]
-                >= final_lower[i]
-            ):
-                supertrend[i] = final_lower[i]
-            else:
-                supertrend[i] = final_upper[i]
-
-        if (
-            supertrend[i]
-            == final_lower[i]
-        ):
-            direction[i] = "GREEN"
-        else:
-            direction[i] = "RED"
-
-    df["final_upper"] = final_upper
-    df["final_lower"] = final_lower
-    df["supertrend"] = supertrend
-    df["direction"] = direction
-
-    return df
-
-
-# ============================================================
-# WEEK IDENTIFICATION
-# ============================================================
-
-def add_week_flags(df):
-    df = df.copy()
-
-    if df["timestamp"].dt.tz is None:
-        df["timestamp"] = (
-            df["timestamp"]
-            .dt.tz_localize("Asia/Kolkata")
-        )
-    else:
-        df["timestamp"] = (
-            df["timestamp"]
-            .dt.tz_convert("Asia/Kolkata")
-        )
-
-    now = pd.Timestamp.now(
-        tz="Asia/Kolkata"
-    )
-
-    iso = df[
-        "timestamp"
-    ].dt.isocalendar()
-
-    current_iso = now.isocalendar()
-
-    df["iso_year"] = iso.year
-    df["iso_week"] = iso.week
-
-    df["is_current_week"] = (
-        (df["iso_year"] == current_iso.year)
-        &
-        (df["iso_week"] == current_iso.week)
+    df["EXIT"] = (
+        previous_bullish &
+        ~df["Bullish"]
     )
 
     return df
 
 
 # ============================================================
-# PROCESS ONE STOCK
+# DOWNLOAD 6 MONTHS DATA
 # ============================================================
 
-def process_stock(
-    symbol,
-    company,
-    instrument_key
-):
+@st.cache_data(ttl=3600, show_spinner=False)
+def download_historical_data():
 
-    df = get_weekly_candles(
-        instrument_key
+    data = yf.download(
+        tickers=TICKERS,
+        period="6mo",
+        interval="1d",
+        group_by="ticker",
+        auto_adjust=False,
+        threads=True,
+        progress=False
     )
 
-    df = add_week_flags(df)
-
-    df = calculate_heikin_ashi(df)
-
-    df = calculate_supertrend(
-        df,
-        ATR_PERIOD,
-        SUPERTREND_MULTIPLIER
-    )
-
-    # Remove rows where ST cannot yet be calculated
-    df_valid = df[
-        df["direction"].notna()
-    ].copy()
-
-    if len(df_valid) < 5:
-        raise RuntimeError(
-            "Insufficient valid weekly Supertrend data."
-        )
-
-    completed = df_valid[
-        ~df_valid["is_current_week"]
-    ].copy()
-
-    if len(completed) < 2:
-        raise RuntimeError(
-            "Insufficient completed weekly candles."
-        )
-
-    previous = completed.iloc[-2]
-    latest_completed = completed.iloc[-1]
-
-    previous_direction = (
-        previous["direction"]
-    )
-
-    completed_direction = (
-        latest_completed["direction"]
-    )
-
-    confirmed_signal = (
-        previous_direction == "RED"
-        and completed_direction == "GREEN"
-    )
-
-    # Current/live week
-    live_row = df_valid.iloc[-1]
-
-    if live_row["is_current_week"]:
-        live_direction = live_row["direction"]
-
-        live_pending = (
-            previous_direction == "RED"
-            and live_direction == "GREEN"
-        )
-
-    else:
-        live_row = latest_completed
-        live_direction = completed_direction
-        live_pending = False
-
-    return {
-        "Symbol": symbol,
-        "Company": company,
-        "Instrument Key": instrument_key,
-
-        "Previous ST": previous_direction,
-        "Completed ST": completed_direction,
-        "Live ST": live_direction,
-
-        "Confirmed Signal": confirmed_signal,
-        "Live Pending": live_pending,
-
-        "Signal Week": str(
-            latest_completed["timestamp"].date()
-        ),
-
-        "HA Close": float(
-            latest_completed["ha_close"]
-        ),
-
-        "Supertrend": float(
-            latest_completed["supertrend"]
-        ),
-
-        "Live HA Close": float(
-            live_row["ha_close"]
-        ),
-
-        "Live Price": float(
-            live_row["close"]
-        ),
-
-        "Data": df
-    }
+    return data
 
 
 # ============================================================
-# FULL SCAN
+# GET CURRENT LTP
 # ============================================================
 
-def run_full_scan():
+@st.cache_data(ttl=60, show_spinner=False)
+def get_current_prices():
 
-    universe = build_universe()
+    try:
 
-    total = len(universe)
+        data = yf.download(
+            tickers=TICKERS,
+            period="1d",
+            interval="1m",
+            group_by="ticker",
+            auto_adjust=False,
+            threads=True,
+            progress=False
+        )
+
+        prices = {}
+
+        for symbol in ETF_LIST:
+
+            ticker = f"{symbol}.NS"
+
+            try:
+
+                if ticker not in data.columns.get_level_values(0):
+                    prices[symbol] = np.nan
+                    continue
+
+                temp = data[ticker].copy()
+
+                temp = temp.dropna(subset=["Close"])
+
+                if len(temp) > 0:
+                    prices[symbol] = float(temp["Close"].iloc[-1])
+                else:
+                    prices[symbol] = np.nan
+
+            except Exception:
+                prices[symbol] = np.nan
+
+        return prices
+
+    except Exception:
+
+        return {symbol: np.nan for symbol in ETF_LIST}
+
+
+# ============================================================
+# EXTRACT SINGLE ETF DATA
+# ============================================================
+
+def get_etf_data(all_data, symbol):
+
+    ticker = f"{symbol}.NS"
+
+    try:
+
+        # Multi-ticker download
+        if isinstance(all_data.columns, pd.MultiIndex):
+
+            if ticker not in all_data.columns.get_level_values(0):
+                return None
+
+            df = all_data[ticker].copy()
+
+        else:
+
+            df = all_data.copy()
+
+        required = ["Open", "High", "Low", "Close", "Volume"]
+
+        for col in required:
+            if col not in df.columns:
+                return None
+
+        df = df[required].copy()
+
+        df = df.dropna(subset=["Close"])
+
+        if df.empty:
+            return None
+
+        return df
+
+    except Exception:
+
+        return None
+
+
+# ============================================================
+# BUILD SCANNER
+# ============================================================
+
+def build_scanner(all_data, current_prices):
 
     results = []
-    failures = []
-    new_signals = 0
 
-    progress = st.progress(0)
-    status_box = st.empty()
+    processed_data = {}
 
-    for index, row in universe.iterrows():
+    for symbol in ETF_LIST:
 
-        symbol = str(row["Symbol"])
-
-        company = (
-            str(row["Company Name"])
-            if "Company Name" in row
-            else symbol
+        df = get_etf_data(
+            all_data,
+            symbol
         )
 
-        instrument_key = row[
-            "instrument_key"
-        ]
-
-        status_box.write(
-            f"Scanning {index + 1}/{total}: "
-            f"**{symbol}**"
-        )
-
-        if (
-            pd.isna(instrument_key)
-            or not str(instrument_key).strip()
-        ):
-
-            failures.append({
-                "Symbol": symbol,
-                "Company": company,
-                "Error": "No Upstox instrument key"
-            })
-
-            progress.progress(
-                (index + 1) / total
-            )
+        if df is None or len(df) < WMA_LENGTH + 5:
             continue
 
-        try:
+        df = calculate_hilega_milega(df)
 
-            result = process_stock(
-                symbol,
-                company,
-                str(instrument_key)
-            )
+        processed_data[symbol] = df
 
-            results.append(result)
+        last = df.iloc[-1]
 
-            if save_signal(result):
-                new_signals += 1
-
-        except Exception as exc:
-
-            failures.append({
-                "Symbol": symbol,
-                "Company": company,
-                "Error": str(exc)
-            })
-
-        progress.progress(
-            (index + 1) / total
+        previous = (
+            df.iloc[-2]
+            if len(df) >= 2
+            else None
         )
 
-        # Small delay between requests
-        time.sleep(0.05)
+        rsi = last["RSI"]
+        ema = last["EMA"]
+        wma = last["WMA"]
 
-    update_watchlist_status(
-        results
-    )
+        bullish = bool(last["Bullish"])
 
-    st.session_state["last_scan_time"] = datetime.now()
-    st.session_state["last_scan_info"] = {
-        "run_time": datetime.now().isoformat(timespec="seconds"),
-        "total": total,
-        "successful": len(results),
-        "failed": len(failures),
-        "new_signals": new_signals,
-    }
+        if bullish:
 
-    status_box.success(
-        f"Scan complete — "
-        f"{len(results)}/{total} successful | "
-        f"{len(failures)} failed | "
-        f"{new_signals} new confirmed signals"
-    )
+            status = "HOLD"
 
-    return results, failures
+        else:
 
+            status = "EXIT"
 
-# ============================================================
-# AUTO-SCAN TIMER
-# ============================================================
+        # ----------------------------------------------------
+        # Last signal
+        # ----------------------------------------------------
 
-def should_scan():
-    last_scan = st.session_state.get("last_scan_time")
+        signal_rows = df[
+            df["BUY"] | df["EXIT"]
+        ]
 
-    if last_scan is None:
-        return True
+        if not signal_rows.empty:
+
+            last_signal_row = signal_rows.iloc[-1]
+            last_signal_date = signal_rows.index[-1]
+
+            if bool(last_signal_row["BUY"]):
+                last_signal = "BUY"
+            else:
+                last_signal = "EXIT"
+
+        else:
+
+            last_signal = "-"
+            last_signal_date = None
+
+        # ----------------------------------------------------
+        # Today's new signal
+        # ----------------------------------------------------
+
+        if bool(last["BUY"]):
+
+            today_signal = "BUY"
+
+        elif bool(last["EXIT"]):
+
+            today_signal = "EXIT"
+
+        else:
+
+            today_signal = "-"
+
+        # ----------------------------------------------------
+        # Current price
+        # ----------------------------------------------------
+
+        current_price = current_prices.get(
+            symbol,
+            np.nan
+        )
+
+        results.append({
+
+            "ETF": symbol,
+
+            "LTP": (
+                round(current_price, 2)
+                if pd.notna(current_price)
+                else round(float(last["Close"]), 2)
+            ),
+
+            "Daily Close": round(
+                float(last["Close"]),
+                2
+            ),
+
+            "RSI(9)": round(
+                float(rsi),
+                2
+            ) if pd.notna(rsi) else np.nan,
+
+            "EMA(3)": round(
+                float(ema),
+                2
+            ) if pd.notna(ema) else np.nan,
+
+            "WMA(21)": round(
+                float(wma),
+                2
+            ) if pd.notna(wma) else np.nan,
+
+            "RSI > WMA": (
+                "YES"
+                if pd.notna(rsi)
+                and pd.notna(wma)
+                and rsi > wma
+                else "NO"
+            ),
+
+            "EMA > WMA": (
+                "YES"
+                if pd.notna(ema)
+                and pd.notna(wma)
+                and ema > wma
+                else "NO"
+            ),
+
+            "Signal": today_signal,
+
+            "Status": status,
+
+            "Last Signal": last_signal,
+
+            "Last Signal Date": (
+                last_signal_date.strftime("%Y-%m-%d")
+                if last_signal_date is not None
+                else "-"
+            )
+        })
 
     return (
-        datetime.now() - last_scan
-    ) >= timedelta(hours=REFRESH_HOURS)
+        pd.DataFrame(results),
+        processed_data
+    )
 
+
+# ============================================================
+# STREAMLIT UI
+# ============================================================
+
+st.title("📊 Hilega-Milega ETF Scanner")
+
+st.caption(
+    "Hilega-Milega by NK Sir (DalRoti) | "
+    "Daily timeframe | 6 months historical data"
+)
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 
-st.sidebar.header(
-    "Scanner Controls"
-)
+with st.sidebar:
 
-st.sidebar.write(
-    f"Universe: **NIFTY 500**"
-)
+    st.header("Settings")
 
-st.sidebar.write(
-    f"Timeframe: **Weekly**"
-)
-
-st.sidebar.write(
-    f"Candle: **Heikin Ashi**"
-)
-
-st.sidebar.write(
-    f"Supertrend: **({ATR_PERIOD}, {SUPERTREND_MULTIPLIER})**"
-)
-
-st.sidebar.write(
-    f"Automatic scan: **Every {REFRESH_HOURS} hours**"
-)
-
-manual_scan = st.sidebar.button(
-    "🔄 RUN SCANNER NOW",
-    width="stretch"
-)
-
-if st.sidebar.button(
-    "🧹 CLEAR ACTIVE WATCHLIST",
-    width="stretch"
-):
-    clear_active_watchlist()
-
-    st.success("Active watchlist cleared.")
-
-    st.rerun()
-
-
-# ============================================================
-# LOCAL WATCHLIST STATUS
-# ============================================================
-
-st.sidebar.caption(
-    f"Watchlist: local VPS → {WATCHLIST_FILE.name}"
-)
-
-# ============================================================
-# RUN SCANNER
-# ============================================================
-
-if manual_scan or should_scan():
-
-    with st.spinner(
-        "Scanning NIFTY 500..."
-    ):
-
-        scan_results, scan_failures = (
-            run_full_scan()
-        )
-
-else:
-
-    scan_results = []
-    scan_failures = []
-
-
-# ============================================================
-# LOAD WATCHLIST
-# ============================================================
-
-watchlist_records = load_watchlist()
-
-WATCHLIST_COLUMNS = [
-    "Symbol",
-    "Company",
-    "Signal Date",
-    "Signal Week",
-    "HA Close",
-    "Previous ST",
-    "Signal ST",
-    "Supertrend",
-    "Status",
-]
-
-watchlist_df = pd.DataFrame(
-    [
-        {
-            "Symbol": x.get("symbol", ""),
-            "Company": x.get("company", ""),
-            "Signal Date": x.get("signal_date", ""),
-            "Signal Week": x.get("signal_week", ""),
-            "HA Close": x.get("ha_close"),
-            "Previous ST": x.get("previous_direction", ""),
-            "Signal ST": x.get("current_direction", ""),
-            "Supertrend": x.get("supertrend"),
-            "Status": x.get("status", "ACTIVE"),
-        }
-        for x in watchlist_records
-    ],
-    columns=WATCHLIST_COLUMNS,
-)
-
-
-# ============================================================
-# LATEST SCAN DATA
-# ============================================================
-
-if scan_results:
-
-    latest_df = pd.DataFrame(
-        [
-            {
-                "Symbol": x["Symbol"],
-                "Company": x["Company"],
-                "Previous ST": x["Previous ST"],
-                "Completed ST": x["Completed ST"],
-                "Live ST": x["Live ST"],
-
-                "Signal": (
-                    "🟢 CONFIRMED"
-                    if x["Confirmed Signal"]
-                    else (
-                        "🟡 LIVE / PENDING"
-                        if x["Live Pending"]
-                        else ""
-                    )
-                ),
-
-                "HA Close": round(
-                    x["HA Close"],
-                    2
-                ),
-
-                "Live HA Close": round(
-                    x["Live HA Close"],
-                    2
-                ),
-
-                "Live Price": round(
-                    x["Live Price"],
-                    2
-                ),
-
-                "Signal Week": x[
-                    "Signal Week"
-                ]
-            }
-            for x in scan_results
-        ]
-    )
-
-else:
-
-    latest_df = pd.DataFrame()
-
-
-# ============================================================
-# TABS
-# ============================================================
-
-(
-    tab_confirmed,
-    tab_live,
-    tab_watchlist,
-    tab_all,
-    tab_status
-) = st.tabs(
-    [
-        "🔥 CONFIRMED",
-        "🟡 LIVE / FRIDAY",
-        "👀 WATCHLIST",
-        "📊 NIFTY 500",
-        "⚙️ STATUS"
-    ]
-)
-
-
-# ============================================================
-# CONFIRMED SIGNALS
-# ============================================================
-
-with tab_confirmed:
-
-    st.subheader(
-        "🔥 Confirmed RED → GREEN"
+    st.write(
+        f"RSI Length: **{RSI_LENGTH}**"
     )
 
     st.write(
-        "Previous completed weekly candle = RED "
-        "and latest completed weekly candle = GREEN."
-    )
-
-    if latest_df.empty:
-
-        st.info(
-            "No scan data yet. Run the scanner."
-        )
-
-    else:
-
-        confirmed = latest_df[
-            latest_df["Signal"]
-            == "🟢 CONFIRMED"
-        ].copy()
-
-        if confirmed.empty:
-
-            st.info(
-                "No new confirmed signals."
-            )
-
-        else:
-
-            st.success(
-                f"{len(confirmed)} confirmed signal(s)"
-            )
-
-            st.dataframe(
-                confirmed,
-                width="stretch",
-                hide_index=True
-            )
-
-
-# ============================================================
-# LIVE / FRIDAY
-# ============================================================
-
-with tab_live:
-
-    st.subheader(
-        "🟡 Live Weekly RED → GREEN Candidates"
-    )
-
-    st.warning(
-        "These are developing signals only. "
-        "The current weekly candle is still incomplete."
+        f"EMA Length: **{EMA_LENGTH}**"
     )
 
     st.write(
-        "Use this tab during the last hour Friday "
-        "for your manual check."
+        f"WMA Length: **{WMA_LENGTH}**"
     )
 
-    if latest_df.empty:
-
-        st.info(
-            "No scan data yet."
-        )
-
-    else:
-
-        pending = latest_df[
-            latest_df["Signal"]
-            == "🟡 LIVE / PENDING"
-        ].copy()
-
-        if pending.empty:
-
-            st.info(
-                "No live RED → GREEN candidates."
-            )
-
-        else:
-
-            st.dataframe(
-                pending,
-                width="stretch",
-                hide_index=True
-            )
-
-
-# ============================================================
-# WATCHLIST
-# ============================================================
-
-with tab_watchlist:
-
-    st.subheader(
-        "👀 Persistent Watchlist"
+    st.write(
+        f"Overbought: **{OVERBOUGHT}**"
     )
 
-    active = watchlist_df[
-        watchlist_df["Status"].fillna("")
-        == "ACTIVE"
-    ].copy()
-
-    c1, c2 = st.columns(2)
-
-    c1.metric(
-        "Active Stocks",
-        len(active)
+    st.write(
+        f"Oversold: **{OVERSOLD}**"
     )
-
-    c2.metric(
-        "Total Signal Records",
-        len(watchlist_df)
-    )
-
-    if active.empty:
-
-        st.info(
-            "No active watchlist stocks."
-        )
-
-    else:
-
-        st.dataframe(
-            active,
-            width="stretch",
-            hide_index=True
-        )
 
     st.divider()
 
-    st.subheader(
-        "Watchlist History"
+    st.write(
+        f"ETFs: **{len(ETF_LIST)}**"
     )
 
-    if watchlist_df.empty:
+    st.write(
+        "Historical: **6 months**"
+    )
 
-        st.info(
-            "No watchlist history."
-        )
+    st.write(
+        "Timeframe: **Daily**"
+    )
 
-    else:
+    st.divider()
 
-        st.dataframe(
-            watchlist_df,
-            width="stretch",
-            hide_index=True
-        )
+    refresh = st.button(
+        "🔄 Refresh Data",
+        use_container_width=True
+    )
+
+    if refresh:
+
+        st.cache_data.clear()
+
+        st.rerun()
 
 
 # ============================================================
-# ALL NIFTY 500
+# DOWNLOAD DATA
 # ============================================================
 
-with tab_all:
+with st.spinner(
+    "Fetching 6 months daily data from Yahoo Finance..."
+):
 
-    st.subheader(
-        "📊 All NIFTY 500 Stocks"
+    historical_data = download_historical_data()
+
+
+if historical_data is None or historical_data.empty:
+
+    st.error(
+        "Yahoo Finance se historical data nahi mila."
     )
 
-    if latest_df.empty:
-
-        st.info(
-            "No scan data yet."
-        )
-
-    else:
-
-        search = st.text_input(
-            "Search Symbol or Company",
-            key="search_symbol"
-        )
-
-        filtered = latest_df.copy()
-
-        if search:
-
-            q = search.upper().strip()
-
-            filtered = filtered[
-                filtered["Symbol"]
-                .str.upper()
-                .str.contains(
-                    q,
-                    na=False
-                )
-                |
-                filtered["Company"]
-                .str.upper()
-                .str.contains(
-                    q,
-                    na=False
-                )
-            ]
-
-        st.dataframe(
-            filtered,
-            width="stretch",
-            hide_index=True
-        )
+    st.stop()
 
 
 # ============================================================
-# STATUS
+# CURRENT LTP
 # ============================================================
 
-with tab_status:
+with st.spinner(
+    "Fetching current LTP..."
+):
 
-    st.subheader(
-        "⚙️ Scanner Status"
+    current_prices = get_current_prices()
+
+
+# ============================================================
+# BUILD RESULTS
+# ============================================================
+
+scanner_df, processed_data = build_scanner(
+    historical_data,
+    current_prices
+)
+
+
+if scanner_df.empty:
+
+    st.error(
+        "Kisi ETF ka valid data nahi mila."
     )
 
-    universe = build_universe()
+    st.stop()
 
-    c1, c2, c3 = st.columns(3)
 
-    c1.metric(
-        "NIFTY 500 CSV",
-        len(universe)
-    )
+# ============================================================
+# SUMMARY
+# ============================================================
 
-    c2.metric(
-        "Instrument Keys",
-        int(
-            universe["instrument_key"]
-            .notna()
-            .sum()
-        )
-    )
+buy_count = int(
+    (scanner_df["Signal"] == "BUY").sum()
+)
 
-    c3.metric(
-        "Refresh",
-        "4 Hours"
-    )
+exit_count = int(
+    (scanner_df["Signal"] == "EXIT").sum()
+)
 
-    info = st.session_state.get("last_scan_info")
+hold_count = int(
+    (scanner_df["Status"] == "HOLD").sum()
+)
 
-    if info:
-        st.write(f"**Last scan:** {info["run_time"]}")
+exit_status_count = int(
+    (scanner_df["Status"] == "EXIT").sum()
+)
 
-        c1, c2, c3, c4 = st.columns(4)
 
-        c1.metric("Scanned", info["total"])
-        c2.metric("Successful", info["successful"])
-        c3.metric("Failed", info["failed"])
-        c4.metric("New Signals", info["new_signals"])
-    else:
-        st.warning("No scan has been completed in this app session.")
+c1, c2, c3, c4 = st.columns(4)
+
+c1.metric(
+    "Total ETFs",
+    len(scanner_df)
+)
+
+c2.metric(
+    "🟢 New BUY",
+    buy_count
+)
+
+c3.metric(
+    "🟡 HOLD",
+    hold_count
+)
+
+c4.metric(
+    "🔴 EXIT",
+    exit_status_count
+)
+
+
+# ============================================================
+# NEW BUY SECTION
+# ============================================================
+
+st.subheader("🟢 Today's BUY Signals")
+
+buy_df = scanner_df[
+    scanner_df["Signal"] == "BUY"
+].copy()
+
+if buy_df.empty:
 
     st.info(
-        f"Watchlist storage: local Lightsail VPS → `{WATCHLIST_FILE}`"
+        "Aaj koi naya BUY signal nahi hai."
     )
 
-    if scan_failures:
+else:
 
-        st.divider()
-
-        st.subheader(
-            "❌ Errors From Current Scan"
-        )
-
-        st.dataframe(
-            pd.DataFrame(scan_failures),
-            width="stretch",
-            hide_index=True
-        )
-
-    st.divider()
-
-    st.markdown(
-        """
-### Signal rules
-
-**Universe**
-- NIFTY 500 from `ind_nifty500list.csv`
-
-**Candle**
-- Heikin Ashi
-
-**Timeframe**
-- Weekly
-
-**Supertrend**
-- ATR period = 7
-- Multiplier = 3
-
-**CONFIRMED**
-- Previous completed week = RED
-- Latest completed week = GREEN
-
-**LIVE / FRIDAY**
-- Previous completed week = RED
-- Current incomplete weekly candle = GREEN
-
-**Watchlist**
-- Confirmed RED → GREEN signals are saved.
-- When the completed weekly Supertrend becomes RED,
-  the active watchlist entry becomes INACTIVE.
-
-**Refresh**
-- Scanner runs automatically after 4 hours have elapsed
-  when the Streamlit application is loaded/refreshed.
-"""
+    st.dataframe(
+        buy_df[
+            [
+                "ETF",
+                "LTP",
+                "Daily Close",
+                "RSI(9)",
+                "EMA(3)",
+                "WMA(21)",
+                "RSI > WMA",
+                "EMA > WMA",
+                "Signal"
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True
     )
 
 
 # ============================================================
-# LAST UPDATE / AUTO PAGE REFRESH
+# EXIT SECTION
 # ============================================================
 
-info = st.session_state.get("last_scan_info")
+st.subheader("🔴 Today's EXIT Signals")
 
-if info:
-    st.caption(
-        f"Last scanner run: {info['run_time']} | "
-        f"Automatic interval: {REFRESH_HOURS} hours"
+exit_df = scanner_df[
+    scanner_df["Signal"] == "EXIT"
+].copy()
+
+if exit_df.empty:
+
+    st.info(
+        "Aaj koi naya EXIT signal nahi hai."
     )
 
-# Browser refresh every 4 hours.
-st.markdown(
-    f"""
-<script>
-setTimeout(function() {{
-    window.location.reload();
-}}, {REFRESH_HOURS * 60 * 60 * 1000});
-</script>
-""",
-    unsafe_allow_html=True
+else:
+
+    st.dataframe(
+        exit_df[
+            [
+                "ETF",
+                "LTP",
+                "Daily Close",
+                "RSI(9)",
+                "EMA(3)",
+                "WMA(21)",
+                "RSI > WMA",
+                "EMA > WMA",
+                "Signal"
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+# ============================================================
+# CURRENT HOLD
+# ============================================================
+
+st.subheader("🟡 Currently HOLD")
+
+hold_df = scanner_df[
+    scanner_df["Status"] == "HOLD"
+].copy()
+
+if hold_df.empty:
+
+    st.info(
+        "Currently koi ETF HOLD condition mein nahi hai."
+    )
+
+else:
+
+    st.dataframe(
+        hold_df[
+            [
+                "ETF",
+                "LTP",
+                "Daily Close",
+                "RSI(9)",
+                "EMA(3)",
+                "WMA(21)",
+                "RSI > WMA",
+                "EMA > WMA",
+                "Status",
+                "Last Signal",
+                "Last Signal Date"
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+# ============================================================
+# ALL ETF SCANNER
+# ============================================================
+
+st.subheader("📋 All ETFs")
+
+display_df = scanner_df.copy()
+
+st.dataframe(
+    display_df,
+    use_container_width=True,
+    hide_index=True
 )
 
 
-st.caption(
-    "For personal use. Market data and signals should be independently verified."
+# ============================================================
+# ETF DETAIL
+# ============================================================
+
+st.divider()
+
+st.subheader("🔎 ETF Detail")
+
+selected_symbol = st.selectbox(
+    "Select ETF",
+    ETF_LIST
+)
+
+
+if selected_symbol in processed_data:
+
+    df = processed_data[selected_symbol].copy()
+
+    # --------------------------------------------------------
+    # Latest values
+    # --------------------------------------------------------
+
+    latest = df.iloc[-1]
+
+    rsi = latest["RSI"]
+    ema = latest["EMA"]
+    wma = latest["WMA"]
+
+    bullish = bool(latest["Bullish"])
+
+    if bullish:
+        detail_status = "🟢 HOLD / BULLISH"
+    else:
+        detail_status = "🔴 EXIT / NOT BULLISH"
+
+    st.markdown(
+        f"### {selected_symbol} — {detail_status}"
+    )
+
+    d1, d2, d3, d4 = st.columns(4)
+
+    d1.metric(
+        "LTP",
+        (
+            f"₹{current_prices.get(selected_symbol, np.nan):.2f}"
+            if pd.notna(
+                current_prices.get(
+                    selected_symbol,
+                    np.nan
+                )
+            )
+            else "N/A"
+        )
+    )
+
+    d2.metric(
+        "RSI(9)",
+        f"{rsi:.2f}"
+        if pd.notna(rsi)
+        else "N/A"
+    )
+
+    d3.metric(
+        "EMA(3)",
+        f"{ema:.2f}"
+        if pd.notna(ema)
+        else "N/A"
+    )
+
+    d4.metric(
+        "WMA(21)",
+        f"{wma:.2f}"
+        if pd.notna(wma)
+        else "N/A"
+    )
+
+    # --------------------------------------------------------
+    # Conditions
+    # --------------------------------------------------------
+
+    st.markdown("### Conditions")
+
+    cond1, cond2 = st.columns(2)
+
+    if pd.notna(rsi) and pd.notna(wma):
+
+        if rsi > wma:
+            cond1.success(
+                f"✅ RSI(9) > WMA(21)  |  "
+                f"{rsi:.2f} > {wma:.2f}"
+            )
+        else:
+            cond1.error(
+                f"❌ RSI(9) <= WMA(21)  |  "
+                f"{rsi:.2f} <= {wma:.2f}"
+            )
+
+    if pd.notna(ema) and pd.notna(wma):
+
+        if ema > wma:
+            cond2.success(
+                f"✅ EMA(3) > WMA(21)  |  "
+                f"{ema:.2f} > {wma:.2f}"
+            )
+        else:
+            cond2.error(
+                f"❌ EMA(3) <= WMA(21)  |  "
+                f"{ema:.2f} <= {wma:.2f}"
+            )
+
+    # --------------------------------------------------------
+    # PRICE CHART
+    # --------------------------------------------------------
+
+    st.markdown("### Daily Price")
+
+    price_fig = go.Figure()
+
+    price_fig.add_trace(
+        go.Candlestick(
+            x=df.index,
+            open=df["Open"],
+            high=df["High"],
+            low=df["Low"],
+            close=df["Close"],
+            name="Price"
+        )
+    )
+
+    # BUY markers
+
+    buy_points = df[df["BUY"]]
+
+    if not buy_points.empty:
+
+        price_fig.add_trace(
+            go.Scatter(
+                x=buy_points.index,
+                y=buy_points["Low"] * 0.995,
+                mode="markers",
+                name="BUY",
+                marker=dict(
+                    symbol="triangle-up",
+                    size=12
+                )
+            )
+        )
+
+    # EXIT markers
+
+    exit_points = df[df["EXIT"]]
+
+    if not exit_points.empty:
+
+        price_fig.add_trace(
+            go.Scatter(
+                x=exit_points.index,
+                y=exit_points["High"] * 1.005,
+                mode="markers",
+                name="EXIT",
+                marker=dict(
+                    symbol="triangle-down",
+                    size=12
+                )
+            )
+        )
+
+    price_fig.update_layout(
+        height=500,
+        xaxis_rangeslider_visible=False,
+        hovermode="x unified"
+    )
+
+    st.plotly_chart(
+        price_fig,
+        use_container_width=True
+    )
+
+    # --------------------------------------------------------
+    # HILEGA-MILEGA CHART
+    # --------------------------------------------------------
+
+    st.markdown(
+        "### Hilega-Milega Indicator"
+    )
+
+    indicator_fig = go.Figure()
+
+    # 60
+
+    indicator_fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=[OVERBOUGHT] * len(df),
+            mode="lines",
+            name="60"
+        )
+    )
+
+    # 50
+
+    indicator_fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=[50] * len(df),
+            mode="lines",
+            name="50"
+        )
+    )
+
+    # 40
+
+    indicator_fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=[OVERSOLD] * len(df),
+            mode="lines",
+            name="40"
+        )
+    )
+
+    # RSI
+
+    indicator_fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=df["RSI"],
+            mode="lines",
+            name="RSI(9)"
+        )
+    )
+
+    # EMA
+
+    indicator_fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=df["EMA"],
+            mode="lines",
+            name="EMA(3)"
+        )
+    )
+
+    # WMA
+
+    indicator_fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=df["WMA"],
+            mode="lines",
+            name="WMA(21)"
+        )
+    )
+
+    # BUY markers
+
+    if not buy_points.empty:
+
+        indicator_fig.add_trace(
+            go.Scatter(
+                x=buy_points.index,
+                y=buy_points["WMA"],
+                mode="markers",
+                name="BUY",
+                marker=dict(
+                    symbol="triangle-up",
+                    size=12
+                )
+            )
+        )
+
+    # EXIT markers
+
+    if not exit_points.empty:
+
+        indicator_fig.add_trace(
+            go.Scatter(
+                x=exit_points.index,
+                y=exit_points["WMA"],
+                mode="markers",
+                name="EXIT",
+                marker=dict(
+                    symbol="triangle-down",
+                    size=12
+                )
+            )
+        )
+
+    indicator_fig.update_layout(
+        height=500,
+        yaxis=dict(
+            range=[0, 100],
+            title="RSI"
+        ),
+        hovermode="x unified"
+    )
+
+    st.plotly_chart(
+        indicator_fig,
+        use_container_width=True
+    )
+
+    # --------------------------------------------------------
+    # RECENT SIGNALS
+    # --------------------------------------------------------
+
+    st.markdown("### Recent BUY / EXIT Signals")
+
+    signal_df = df[
+        df["BUY"] | df["EXIT"]
+    ].copy()
+
+    if signal_df.empty:
+
+        st.info(
+            "No BUY/EXIT signals found in 6 months."
+        )
+
+    else:
+
+        signal_display = pd.DataFrame({
+
+            "Date": signal_df.index.strftime(
+                "%Y-%m-%d"
+            ),
+
+            "Signal": np.where(
+                signal_df["BUY"],
+                "BUY",
+                "EXIT"
+            ),
+
+            "Close": signal_df["Close"].round(2),
+
+            "RSI(9)": signal_df["RSI"].round(2),
+
+            "EMA(3)": signal_df["EMA"].round(2),
+
+            "WMA(21)": signal_df["WMA"].round(2)
+
+        })
+
+        signal_display = signal_display.iloc[::-1]
+
+        st.dataframe(
+            signal_display.head(20),
+            use_container_width=True,
+            hide_index=True
+        )
+
+else:
+
+    st.error(
+        f"{selected_symbol} ka data available nahi hai."
+    )
+
+
+# ============================================================
+# LOGIC EXPLANATION
+# ============================================================
+
+st.divider()
+
+st.markdown("### 📌 Trading Logic")
+
+st.markdown(
+    """
+**BUY**
+
+- RSI(9) > WMA(21)
+- AND EMA(3) > WMA(21)
+- Dono condition FALSE → TRUE hone par **sirf ek BUY**
+
+**HOLD**
+
+- RSI(9) > WMA(21)
+- AND EMA(3) > WMA(21)
+- Condition true rehne tak **HOLD**
+
+**EXIT**
+
+- RSI(9) <= WMA(21)
+- OR EMA(3) <= WMA(21)
+- Condition TRUE → FALSE hone par **sirf ek EXIT**
+
+**Historical data:** 6 months daily candles  
+**Current LTP:** Yahoo Finance latest intraday price  
+**Auto refresh:** OFF
+"""
 )
